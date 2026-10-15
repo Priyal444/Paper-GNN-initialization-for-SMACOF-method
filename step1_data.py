@@ -34,8 +34,11 @@ def mixed_set(rng, count):
     noise_names = list(C.NOISE_MODELS)
     while len(out) < count:
         n = int(rng.integers(C.TRAIN_N_RANGE[0], C.TRAIN_N_RANGE[1] + 1))
-        mp = float(rng.uniform(*C.TRAIN_MISSING))
         gt = C.GRAPH_TYPES[rng.integers(len(C.GRAPH_TYPES))]
+        lo, hi = C.TRAIN_MISSING
+        if gt == "ba":                     # BA cannot go below ~50 % missing (see common.ba_m_for)
+            lo = max(lo, 0.5)
+        mp = float(rng.uniform(lo, hi))
         nz = noise_names[rng.integers(len(noise_names))]
         g = make_graph(rng, n, gt, mp, C.NOISE_MODELS[nz], C.N_ANCHORS, C.COORD_RANGE)
         g["noise"] = nz
