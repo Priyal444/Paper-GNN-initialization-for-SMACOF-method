@@ -1,0 +1,10 @@
+﻿__pycache__/
+*.pyc
+data/
+checkpoints/
+results/
+extracted_texts/
+Euclidean Distance Matrices*.pdf
+Graph Neural Network for Large-Scale*.pdf
+mere paper ki jaisa*.pdf
+.ipynb_checkpoints/

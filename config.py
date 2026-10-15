@@ -1,0 +1,110 @@
+"""
+config.py -- every experiment setting in ONE place.
+Change things here, never inside the step files.
+"""
+import os
+
+# ----------------------------------------------------------------------------
+# Problem size
+# ----------------------------------------------------------------------------
+N_NODES        = 50          # nodes per test graph (the paper's main setting)
+N_ANCHORS      = 3           # the theoretical minimum in 2-D (d + 1)
+COORD_RANGE    = 10.0        # points are uniform in [-COORD_RANGE, COORD_RANGE]^2
+
+# ----------------------------------------------------------------------------
+# How edges go missing
+#   "random" : spanning tree + random extra edges (fast, always connected)
+#   "rgg"    : random geometric graph -- keep the SHORTEST pairs
+#              (+ Euclidean MST so it is connected). This is how real
+#              sensor networks lose links (radio range).
+#   "ba"     : Barabasi-Albert, m chosen so m*(n-m) edges match the missing %.
+#              BA has at most n^2/4 edges, so it only exists at >= ~50 %
+#              missing; lower test levels are skipped for BA.
+# ----------------------------------------------------------------------------
+GRAPH_TYPES     = ["random", "rgg", "ba"]      # training mix
+MISSING_LEVELS  = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+
+# ----------------------------------------------------------------------------
+# Noise on the RAW distances (not squared):
+#   d_obs = d_true * (1 + sigma * N(0,1))  +  Bernoulli(p_nlos) * U[0, nlos_max]
+# The second term is a POSITIVE non-line-of-sight (NLOS) bias, as in
+# Yan et al. (ICASSP 2021). nlos_max is in coordinate units (area is 20 x 20).
+# ----------------------------------------------------------------------------
+NOISE_MODELS = {
+    "clean": dict(sigma=0.00, p_nlos=0.0, nlos_max=0.0),
+    "gauss": dict(sigma=0.05, p_nlos=0.0, nlos_max=0.0),
+    "nlos":  dict(sigma=0.02, p_nlos=0.2, nlos_max=4.0),
+}
+
+# ----------------------------------------------------------------------------
+# Datasets (step 1)
+# ----------------------------------------------------------------------------
+N_TRAIN          = 3000      # training graphs (random missing %, noise, type)
+N_VAL            = 400
+TRAIN_N_RANGE    = (30, 80)  # train on VARIABLE sizes -> generalises in n
+TRAIN_MISSING    = (0.10, 0.90)
+TEST_PER_LEVEL   = 20        # test graphs per (scenario, missing level)
+TEST_SCENARIOS   = [("random", "clean"), ("random", "nlos"),
+                    ("rgg", "clean"),    ("rgg", "nlos"),
+                    ("ba", "clean"),     ("ba", "nlos")]
+GENERALISE_SIZES = [100, 200]          # extra test sets, never seen in training
+GENERALISE_SCENARIO = ("rgg", "nlos")
+GENERALISE_LEVELS = [0.5, 0.7, 0.9]
+BA_M_VALUES      = [1, 2, 3, 4, 5]     # rigidity-threshold experiment
+BA_PER_M         = 20
+SEED             = 1234
+
+# ----------------------------------------------------------------------------
+# Model (step 2)
+# ----------------------------------------------------------------------------
+HIDDEN          = 96
+ENC_LAYERS      = 5          # message-passing layers in the encoder
+REFINE_STEPS    = 10         # unrolled learned-SMACOF steps during TRAINING
+TEST_REFINE_STEPS = 50       # steps at TEST time (same shared step, run longer:
+                             # exact fits are fixed points, so more steps only converge further)
+VARIANT         = "learned"  # "learned" | "uniform" | "huber" | "encoder_only"
+LOSS_MODE       = "supervised"   # "supervised" (synthetic GT) | "selfsup" (no GT)
+HUBER_DELTA     = 0.05       # in normalised units (anchor-triangle scale = 1)
+AUX_WEIGHT      = 0.3        # weight of the encoder-output loss (deep supervision)
+EPOCHS          = 50
+BATCH_GRAPHS    = 32
+LR              = 1e-3
+WEIGHT_DECAY    = 1e-5
+GRAD_CLIP       = 1.0
+
+# ----------------------------------------------------------------------------
+# Evaluation (step 3)
+# ----------------------------------------------------------------------------
+RUN_SDP            = True    # Biswas-Ye SDP via cvxpy (slowest baseline)
+RUN_PERGRAPH_SAGE  = True    # your previous approach (per-graph training)
+PERGRAPH_EPOCHS    = 1000
+YAN_GCN_EPOCHS     = 200
+RUN_GENERALISATION = True
+RUN_BA_EXPERIMENT  = True
+
+# ----------------------------------------------------------------------------
+# Paths
+# ----------------------------------------------------------------------------
+ROOT        = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR    = os.path.join(ROOT, "data")
+CKPT_DIR    = os.path.join(ROOT, "checkpoints")
+RESULTS_DIR = os.path.join(ROOT, "results")
+for _d in (DATA_DIR, CKPT_DIR, RESULTS_DIR):
+    os.makedirs(_d, exist_ok=True)
+
+# Any of these can be overridden from the environment, e.g.  EPOCHS=10 python step2_train.py
+for _k in ("N_TRAIN", "N_VAL", "TEST_PER_LEVEL", "EPOCHS", "PERGRAPH_EPOCHS", "REFINE_STEPS", "TEST_REFINE_STEPS"):
+    if _k in os.environ:
+        globals()[_k] = int(os.environ[_k])
+for _k in ("RUN_SDP", "RUN_PERGRAPH_SAGE"):       # e.g.  RUN_SDP=0 python step3_evaluate.py
+    if _k in os.environ:
+        globals()[_k] = os.environ[_k] == "1"
+SDP_MAX_N = 100   # SDP gets slow for big graphs (n=200 ~ 1 min/graph): skipped above this
+
+# Set QUICK=1 in the environment for a tiny smoke-test run.
+if os.environ.get("QUICK") == "1":
+    N_TRAIN, N_VAL, TEST_PER_LEVEL, EPOCHS = 200, 40, 2, 3
+    MISSING_LEVELS = [0.3, 0.7, 0.9]
+    GENERALISE_LEVELS = [0.7]
+    BA_PER_M = 2
+    PERGRAPH_EPOCHS, YAN_GCN_EPOCHS = 50, 30
