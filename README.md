@@ -14,6 +14,20 @@ python step2_train.py --variant encoder_only
 python step3_evaluate.py                  # comparison + figures -> results/
 ```
 
+Transfer across graph types (train on some of spanning-tree / RGG / BA, test on all three;
+every training set has the same total size, N_TRAIN):
+
+```
+python step2_train.py --train-on random       # train on 1 type, test on the other 2
+python step2_train.py --train-on rgg
+python step2_train.py --train-on ba
+python step2_train.py --train-on random+rgg   # train on 2 types, test on the 3rd
+python step2_train.py --train-on random+ba
+python step2_train.py --train-on rgg+ba
+python step2_train.py --train-on all          # train on all 3
+python step3_evaluate.py --transfer           # after the main step 3; -> fig_transfer_matrix.png
+```
+
 Smoke test first: put `QUICK=1` in front of each command (~2 min total).
 Override counts without editing: `EPOCHS=10 TEST_PER_LEVEL=5 python ...`.
 

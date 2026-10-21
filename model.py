@@ -56,8 +56,14 @@ def collate(graphs, device="cpu"):
         n = g["n"]
         xs.append(g["x"]); x0s.append(g["x0"])
         eis.append(g["edge_index"] + off); eas.append(g["edge_attr"]); des.append(g["d_edge"])
-        ys.append((g["true_xy"] - g["center"]) / g["scale"])       # normalised GT
-        a = np.zeros(n, bool); a[g["anchors"]] = True; am.append(a)
+        if "y_norm" in g:
+            ys.append(g["y_norm"])
+        else:
+            ys.append((g["true_xy"] - g["center"]) / g["scale"])       # normalised GT
+        if "anchor_mask" in g:
+            am.append(g["anchor_mask"])
+        else:
+            a = np.zeros(n, bool); a[g["anchors"]] = True; am.append(a)
         batch.append(np.full(n, b)); cen.append(g["center"]); sca.append(g["scale"])
         off += n
     T = lambda a, dt=torch.float32: torch.as_tensor(np.concatenate(a), dtype=dt, device=device)
@@ -68,6 +74,7 @@ def collate(graphs, device="cpu"):
         scale=torch.as_tensor(np.array(sca), device=device), n_graphs=len(graphs),
         sizes=[g["n"] for g in graphs],
     )
+
 
 
 # -----------------------------------------------------------------------------

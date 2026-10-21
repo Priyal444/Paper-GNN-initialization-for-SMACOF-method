@@ -50,6 +50,43 @@ def procrustes_O2(X, anchors, A):
     return (X - sc) @ best.T + ac
 
 
+def classical_mds_torch(D, d=2, device="cpu"):
+    n = D.shape[0]
+    dev = torch.device(device if (device != "cpu" and torch.cuda.is_available()) else "cpu")
+    Dt = torch.as_tensor(D, dtype=torch.float32, device=dev)
+    J = torch.eye(n, device=dev) - (1.0 / n)
+    B = -0.5 * J @ (Dt ** 2) @ J
+    w, V = torch.linalg.eigh((B + B.T) / 2)
+    idx = torch.arange(n - 1, n - d - 1, -1, device=dev)
+    val = torch.clamp(w[idx], min=0.0)
+    X = V[:, idx] * torch.sqrt(val)
+    return X
+
+
+def procrustes_torch(X, anchors, A, device="cpu"):
+    dev = X.device
+    anc = torch.as_tensor(anchors, dtype=torch.long, device=dev)
+    At = torch.as_tensor(A, dtype=torch.float32, device=dev)
+    S = X[anc]
+    sc = S.mean(0)
+    ac = At.mean(0)
+    H = (S - sc).T @ (At - ac)
+    U, _, Vt = torch.linalg.svd(H)
+    best_R = None
+    best_err = float("inf")
+    for sg in (1.0, -1.0):
+        V_curr = Vt.clone()
+        V_curr[-1, :] *= sg
+        R = V_curr.T @ U.T
+        err = torch.norm((S - sc) @ R.T - (At - ac))
+        if err < best_err:
+            best_R = R
+            best_err = err
+    X_aligned = (X - sc) @ best_R.T + ac
+    X_aligned[anc] = At
+    return X_aligned
+
+
 def _pin(g, X):
     X = X.copy(); X[g["anchors"]] = g["anchor_xy"]; return X
 
@@ -101,10 +138,28 @@ def mds_map_huber(g):
     return stress_lbfgs(g, mds_map(g), robust=True)
 
 
-def dv_dwmds(g, iters=300, alpha=0.5):
+def dv_dwmds(g, iters=300, alpha=0.5, device="cpu"):
     n, E, d = g["n"], g["edges"], g["d_obs"].astype(float)
     G = geodesic_matrix(n, E, d)[:, g["anchors"]]
     X = _pin(g, multilaterate(g["anchor_xy"].astype(float), G))
+    if device != "cpu" and torch.cuda.is_available():
+        dev = torch.device(device)
+        src = torch.as_tensor(np.r_[E[:, 0], E[:, 1]], dtype=torch.long, device=dev)
+        dst = torch.as_tensor(np.r_[E[:, 1], E[:, 0]], dtype=torch.long, device=dev)
+        dd = torch.as_tensor(np.r_[d, d], dtype=torch.float32, device=dev)
+        deg = torch.bincount(dst, minlength=n).float().unsqueeze(1).to(dev)
+        Xt = torch.as_tensor(X, dtype=torch.float32, device=dev)
+        anc = torch.as_tensor(g["anchors"], dtype=torch.long, device=dev)
+        axy = torch.as_tensor(g["anchor_xy"], dtype=torch.float32, device=dev)
+        for _ in range(iters):
+            diff = Xt[dst] - Xt[src]
+            dh = diff.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+            t = Xt[src] + dd.unsqueeze(1) * diff / dh
+            num = torch.zeros_like(Xt)
+            num.index_add_(0, dst, t)
+            Xt = Xt + alpha * (num / deg - Xt)
+            Xt[anc] = axy
+        return Xt.cpu().numpy()
     src, dst = np.r_[E[:, 0], E[:, 1]], np.r_[E[:, 1], E[:, 0]]
     dd = np.r_[d, d]
     deg = np.bincount(dst, minlength=n)[:, None]
@@ -117,7 +172,7 @@ def dv_dwmds(g, iters=300, alpha=0.5):
     return X
 
 
-def sdp_biswas_ye(g):
+def sdp_biswas_ye(g, device="cpu"):
     """
     Z = [[I_2, X], [X^T, Y]] >= 0,  X = unknown positions (2 x m).
       unknown-unknown edge: Y_ii + Y_jj - 2 Y_ij      = d^2 + s_ij
@@ -150,7 +205,14 @@ def sdp_biswas_ye(g):
     cons = [Z[0, 0] == 1, Z[1, 1] == 1, Z[0, 1] == 0]
     prob = cp.Problem(cp.Minimize(sum(cp.sum(cp.abs(r)) for r in res)), cons)
     try:
-        prob.solve(solver=cp.SCS, max_iters=5000, eps=1e-5, verbose=False)
+        use_gpu = (device != "cpu" and torch.cuda.is_available())
+        try:
+            if use_gpu:
+                prob.solve(solver=cp.SCS, max_iters=5000, eps=1e-5, verbose=False, gpu=True)
+            else:
+                prob.solve(solver=cp.SCS, max_iters=5000, eps=1e-5, verbose=False)
+        except Exception:
+            prob.solve(solver=cp.SCS, max_iters=5000, eps=1e-5, verbose=False)
         Xu = np.asarray(Z.value[:2, 2:]).T
     except Exception:
         return mds_map(g)
@@ -158,7 +220,7 @@ def sdp_biswas_ye(g):
     return _pin(g, X)
 
 
-def yan_gcn(g, epochs=200, hidden=256, lr=0.01, dropout=0.5, seed=0):
+def yan_gcn(g, epochs=200, hidden=256, lr=0.01, dropout=0.5, seed=0, device="cpu"):
     """
     Yan et al. 2021 (ICASSP), reproduced on our graphs:
       features = rows of the (thresholded = observed) distance matrix, row-normalised
@@ -167,24 +229,26 @@ def yan_gcn(g, epochs=200, hidden=256, lr=0.01, dropout=0.5, seed=0):
     Paper used 2000 hidden units; 256 is used here for speed.
     """
     torch.manual_seed(seed)
+    dev = torch.device(device if (device != "cpu" and torch.cuda.is_available()) else "cpu")
     n, E, d = g["n"], g["edges"], g["d_obs"].astype(np.float32)
     Xd = np.zeros((n, n), np.float32)
     Xd[E[:, 0], E[:, 1]] = d; Xd[E[:, 1], E[:, 0]] = d
-    Xf = Xd / np.maximum(np.linalg.norm(Xd, axis=1, keepdims=True), 1e-9)
+    Xf_np = Xd / np.maximum(np.linalg.norm(Xd, axis=1, keepdims=True), 1e-9)
     A = (Xd > 0).astype(np.float32) + np.eye(n, dtype=np.float32)
     Dm = 1.0 / np.sqrt(A.sum(1))
-    Ah = torch.tensor(Dm[:, None] * A * Dm[None, :])
-    Xf = torch.tensor(Xf)
-    W1, W2 = nn.Linear(n, hidden), nn.Linear(hidden, 2)
+    Ah = torch.tensor(Dm[:, None] * A * Dm[None, :], device=dev)
+    Xf = torch.tensor(Xf_np, device=dev)
+    W1, W2 = nn.Linear(n, hidden).to(dev), nn.Linear(hidden, 2).to(dev)
     opt = torch.optim.Adam(list(W1.parameters()) + list(W2.parameters()), lr=lr)
-    a = torch.tensor(g["anchors"]); ya = torch.tensor(g["anchor_xy"])
+    a = torch.tensor(g["anchors"], dtype=torch.long, device=dev)
+    ya = torch.tensor(g["anchor_xy"], dtype=torch.float32, device=dev)
     def fwd(train):                       # R = A_h relu(A_h X W1) W2   (paper eq. 5)
         h = F.dropout(F.relu(W1(Ah @ Xf)), dropout, train)
         return Ah @ W2(h)
     for _ in range(epochs):
         opt.zero_grad(); loss = F.mse_loss(fwd(True)[a], ya); loss.backward(); opt.step()
     with torch.no_grad():
-        return _pin(g, fwd(False).numpy())
+        return _pin(g, fwd(False).cpu().numpy())
 
 
 class _SAGE(nn.Module):
@@ -199,18 +263,21 @@ class _SAGE(nn.Module):
         return x + self.out(h)
 
 
-def pergraph_sage(g, epochs=1000, lr=1e-3, seed=0):
+def pergraph_sage(g, epochs=1000, lr=1e-3, seed=0, device="cpu"):
     """Your previous pipeline (step1_corrected): MDS-MAP init -> GraphSAGE with a
     residual output, trained from scratch on THIS graph with Huber stress + anchors."""
     torch.manual_seed(seed)
+    dev = torch.device(device if (device != "cpu" and torch.cuda.is_available()) else "cpu")
     n, E = g["n"], g["edges"]
-    x0 = torch.tensor(mds_map(g), dtype=torch.float32)
+    x0 = torch.tensor(mds_map(g), dtype=torch.float32, device=dev)
     A = np.zeros((n, n), np.float32); A[E[:, 0], E[:, 1]] = 1; A[E[:, 1], E[:, 0]] = 1
-    An = torch.tensor(A / A.sum(1, keepdims=True))
-    I, J = torch.tensor(E[:, 0]), torch.tensor(E[:, 1])
-    d = torch.tensor(g["d_obs"]); s = d.mean()
-    a = torch.tensor(g["anchors"]); ya = torch.tensor(g["anchor_xy"])
-    model = _SAGE(); opt = torch.optim.Adam(model.parameters(), lr=lr)
+    An = torch.tensor(A / A.sum(1, keepdims=True), device=dev)
+    I = torch.tensor(E[:, 0], dtype=torch.long, device=dev)
+    J = torch.tensor(E[:, 1], dtype=torch.long, device=dev)
+    d = torch.tensor(g["d_obs"], dtype=torch.float32, device=dev); s = d.mean()
+    a = torch.tensor(g["anchors"], dtype=torch.long, device=dev)
+    ya = torch.tensor(g["anchor_xy"], dtype=torch.float32, device=dev)
+    model = _SAGE().to(dev); opt = torch.optim.Adam(model.parameters(), lr=lr)
     for _ in range(epochs):
         opt.zero_grad()
         X = model(x0, An)
@@ -218,21 +285,139 @@ def pergraph_sage(g, epochs=1000, lr=1e-3, seed=0):
         loss = F.huber_loss((dh - d) / s, torch.zeros_like(d)) + (((X[a] - ya) / s) ** 2).sum(-1).mean()
         loss.backward(); opt.step()
     with torch.no_grad():
-        return _pin(g, model(x0, An).numpy())
+        return _pin(g, model(x0, An).cpu().numpy())
 
 
-def get_baselines(cfg):
+def naive_classical_mds(g, device="cpu"):
+    """Classical MDS (Algorithm 1) directly on observed distances (unobserved = 0)."""
+    dev = torch.device(device if (device != "cpu" and torch.cuda.is_available()) else "cpu")
+    n, E, d = g["n"], g["edges"], g["d_obs"].astype(np.float32)
+    src = torch.as_tensor(E[:, 0], dtype=torch.long, device=dev)
+    dst = torch.as_tensor(E[:, 1], dtype=torch.long, device=dev)
+    Dt = torch.zeros((n, n), dtype=torch.float32, device=dev)
+    dd = torch.as_tensor(d, dtype=torch.float32, device=dev)
+    Dt[src, dst] = dd
+    Dt[dst, src] = dd
+    X = classical_mds_torch(Dt, d=2, device=dev)
+    return procrustes_torch(X, g["anchors"], g["anchor_xy"], device=dev).cpu().numpy()
+
+
+def rank_complete_edm(g, max_iters=100, tol=1e-5, device="cpu"):
+    """Dokmanic et al. Algorithm 2: Alternating Rank-Based EDM Completion."""
+    dev = torch.device(device if (device != "cpu" and torch.cuda.is_available()) else "cpu")
+    n, E, d = g["n"], g["edges"], g["d_obs"].astype(np.float32)
+    W = torch.zeros((n, n), dtype=torch.bool, device=dev)
+    src = torch.as_tensor(E[:, 0], dtype=torch.long, device=dev)
+    dst = torch.as_tensor(E[:, 1], dtype=torch.long, device=dev)
+    W[src, dst] = True
+    W[dst, src] = True
+    d2 = torch.as_tensor(d ** 2, dtype=torch.float32, device=dev)
+    D2 = torch.zeros((n, n), dtype=torch.float32, device=dev)
+    D2[src, dst] = d2
+    D2[dst, src] = d2
+    mu = d2.mean()
+    D_cur = torch.where(W, D2, mu)
+    D_cur.fill_diagonal_(0.0)
+    r = 4  # rank d+2
+    for _ in range(max_iters):
+        w, V = torch.linalg.eigh((D_cur + D_cur.T) / 2)
+        idx = torch.topk(w.abs(), r).indices
+        D_next = (V[:, idx] * w[idx]) @ V[:, idx].T
+        D_next[W] = D2[W]
+        D_next.fill_diagonal_(0.0)
+        D_next.clamp_min_(0.0)
+        if torch.norm(D_next - D_cur) / (torch.norm(D_cur) + 1e-9) < tol:
+            break
+        D_cur = D_next
+    D_est = torch.sqrt(D_cur)
+    X = classical_mds_torch(D_est, d=2, device=dev)
+    return procrustes_torch(X, g["anchors"], g["anchor_xy"], device=dev).cpu().numpy()
+
+
+def optspace_edm(g, rank=4, device="cpu"):
+    """Dokmanic et al. Algorithm 3: OptSpace EDM Completion."""
+    dev = torch.device(device if (device != "cpu" and torch.cuda.is_available()) else "cpu")
+    n, E, d = g["n"], g["edges"], g["d_obs"].astype(np.float32)
+    W = torch.zeros((n, n), dtype=torch.bool, device=dev)
+    src = torch.as_tensor(E[:, 0], dtype=torch.long, device=dev)
+    dst = torch.as_tensor(E[:, 1], dtype=torch.long, device=dev)
+    W[src, dst] = True
+    W[dst, src] = True
+    d2 = torch.as_tensor(d ** 2, dtype=torch.float32, device=dev)
+    D2 = torch.zeros((n, n), dtype=torch.float32, device=dev)
+    D2[src, dst] = d2
+    D2[dst, src] = d2
+    total_pairs = n * (n - 1) / 2.0
+    p = max(len(E) / total_pairs, 1e-4)
+    M_scaled = D2 / p
+    deg = W.sum(dim=1).float()
+    avg_deg = deg.mean()
+    trim_mask = deg > (2.0 * avg_deg)
+    M_trimmed = M_scaled.clone()
+    if trim_mask.any():
+        M_trimmed[trim_mask, :] = 0.0
+        M_trimmed[:, trim_mask] = 0.0
+    U, s, Vt = torch.linalg.svd(M_trimmed, full_matrices=False)
+    U_r, s_r, Vt_r = U[:, :rank], s[:rank], Vt[:rank, :]
+    D_est = U_r @ torch.diag(s_r) @ Vt_r
+    D_est[W] = D2[W]
+    D_est.fill_diagonal_(0.0)
+    D_est.clamp_min_(0.0)
+    D_dist = torch.sqrt(D_est)
+    X = classical_mds_torch(D_dist, d=2, device=dev)
+    return procrustes_torch(X, g["anchors"], g["anchor_xy"], device=dev).cpu().numpy()
+
+
+def alternating_descent(g, max_iters=50, device="cpu"):
+    """Dokmanic et al. Algorithm 4: Alternating Descent on s-stress."""
+    dev = torch.device(device if (device != "cpu" and torch.cuda.is_available()) else "cpu")
+    n, E, d = g["n"], g["edges"], g["d_obs"].astype(np.float32)
+    src = torch.as_tensor(E[:, 0], dtype=torch.long, device=dev)
+    dst = torch.as_tensor(E[:, 1], dtype=torch.long, device=dev)
+    d2 = torch.as_tensor(d ** 2, dtype=torch.float32, device=dev)
+    anc = torch.as_tensor(g["anchors"], dtype=torch.long, device=dev)
+    axy = torch.as_tensor(g["anchor_xy"], dtype=torch.float32, device=dev)
+    is_free = torch.ones(n, dtype=torch.bool, device=dev)
+    is_free[anc] = False
+    free_idx = torch.nonzero(is_free).squeeze(-1)
+    X_free = torch.nn.Parameter(torch.zeros((len(free_idx), 2), dtype=torch.float32, device=dev))
+    optimizer = torch.optim.LBFGS([X_free], max_iter=max_iters, lr=1.0, line_search_fn="strong_wolfe")
+    def closure():
+        optimizer.zero_grad()
+        X_full = torch.zeros((n, 2), dtype=torch.float32, device=dev)
+        X_full[anc] = axy
+        X_full[free_idx] = X_free
+        diff = X_full[src] - X_full[dst]
+        dhat2 = (diff ** 2).sum(dim=-1)
+        loss = ((dhat2 - d2) ** 2).sum()
+        loss.backward()
+        return loss
+    try:
+        optimizer.step(closure)
+    except Exception:
+        pass
+    X_final = torch.zeros((n, 2), dtype=torch.float32, device=dev)
+    X_final[anc] = axy
+    X_final[free_idx] = X_free.detach()
+    return X_final.cpu().numpy()
+
+
+def get_baselines(cfg, device="cpu"):
     B = {
         "MDS-MAP": mds_map,
         "MDS-MAP + stress (L-BFGS)": mds_map_stress,
         "MDS-MAP + Huber stress": mds_map_huber,
-        "DV-distance + dwMDS (no learning)": dv_dwmds,
-        "Yan et al. GCN (3 anchor labels)": lambda g: yan_gcn(g, epochs=cfg.YAN_GCN_EPOCHS),
+        "DV-distance + dwMDS (no learning)": lambda g: dv_dwmds(g, device=device),
+        "Classical MDS (direct)": lambda g: naive_classical_mds(g, device=device),
+        "Rank Alternation (EDM book Alg 2)": lambda g: rank_complete_edm(g, device=device),
+        "OptSpace (EDM book Alg 3)": lambda g: optspace_edm(g, device=device),
+        "Alternating Descent (EDM book Alg 4)": lambda g: alternating_descent(g, device=device),
+        "Yan et al. GCN (3 anchor labels)": lambda g: yan_gcn(g, epochs=cfg.YAN_GCN_EPOCHS, device=device),
     }
     if cfg.RUN_SDP:
-        B["SDP (Biswas-Ye)"] = sdp_biswas_ye
+        B["SDP (Biswas-Ye)"] = lambda g: sdp_biswas_ye(g, device=device)
     if cfg.RUN_PERGRAPH_SAGE:
-        B["Per-graph GraphSAGE (previous)"] = lambda g: pergraph_sage(g, epochs=cfg.PERGRAPH_EPOCHS)
+        B["Per-graph GraphSAGE (previous)"] = lambda g: pergraph_sage(g, epochs=cfg.PERGRAPH_EPOCHS, device=device)
     return B
 
 

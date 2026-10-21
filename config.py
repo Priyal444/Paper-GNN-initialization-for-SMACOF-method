@@ -52,6 +52,17 @@ GENERALISE_SCENARIO = ("rgg", "nlos")
 GENERALISE_LEVELS = [0.5, 0.7, 0.9]
 BA_M_VALUES      = [1, 2, 3, 4, 5]     # rigidity-threshold experiment
 BA_PER_M         = 20
+
+# Cross-graph-type transfer: train on a subset of graph types, test on all.
+# Every training set has the SAME total size (N_TRAIN, split equally over its
+# types), so differences come from variety, not from amount of data.
+# Validation (checkpoint selection) uses only the training types: no peeking
+# at the held-out type.
+RUN_TRANSFER        = True
+TRANSFER_TRAIN_SETS = ["random", "rgg", "ba",                   # train on 1, test on the other 2
+                       "random+rgg", "random+ba", "rgg+ba",     # train on 2, test on the 3rd
+                       "all"]                                   # train on all 3
+TRANSFER_MIN_MISSING = 0.5   # matrix averages over missing >= 50 % (BA exists only there)
 SEED             = 1234
 
 # ----------------------------------------------------------------------------
@@ -82,6 +93,15 @@ YAN_GCN_EPOCHS     = 200
 RUN_GENERALISATION = True
 RUN_BA_EXPERIMENT  = True
 
+
+def train_types(key):
+    """'rgg+ba' -> ['rgg', 'ba'];  'all' -> GRAPH_TYPES."""
+    types = list(GRAPH_TYPES) if key == "all" else key.split("+")
+    bad = [t for t in types if t not in GRAPH_TYPES]
+    if bad:
+        raise ValueError(f"unknown graph type(s) {bad}; choose from {GRAPH_TYPES} or 'all'")
+    return types
+
 # ----------------------------------------------------------------------------
 # Paths
 # ----------------------------------------------------------------------------
@@ -93,10 +113,11 @@ for _d in (DATA_DIR, CKPT_DIR, RESULTS_DIR):
     os.makedirs(_d, exist_ok=True)
 
 # Any of these can be overridden from the environment, e.g.  EPOCHS=10 python step2_train.py
-for _k in ("N_TRAIN", "N_VAL", "TEST_PER_LEVEL", "EPOCHS", "PERGRAPH_EPOCHS", "REFINE_STEPS", "TEST_REFINE_STEPS"):
+for _k in ("N_TRAIN", "N_VAL", "TEST_PER_LEVEL", "BA_PER_M", "EPOCHS", "PERGRAPH_EPOCHS", "REFINE_STEPS",
+           "TEST_REFINE_STEPS"):
     if _k in os.environ:
         globals()[_k] = int(os.environ[_k])
-for _k in ("RUN_SDP", "RUN_PERGRAPH_SAGE"):       # e.g.  RUN_SDP=0 python step3_evaluate.py
+for _k in ("RUN_SDP", "RUN_PERGRAPH_SAGE", "RUN_TRANSFER"):       # e.g.  RUN_SDP=0 python step3_evaluate.py
     if _k in os.environ:
         globals()[_k] = os.environ[_k] == "1"
 SDP_MAX_N = 100   # SDP gets slow for big graphs (n=200 ~ 1 min/graph): skipped above this
