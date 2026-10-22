@@ -139,14 +139,29 @@ def score_rows(g, method, X, secs):
                 frac_certified=float(g["certified"].mean()), ba_m=g.get("ba_m"))
 
 
+def warmup_cuda(devices):
+    for dev in devices:
+        if "cuda" in dev:
+            try:
+                dummy = torch.eye(4, device=dev)
+                _ = torch.linalg.eigh(dummy)
+                _ = torch.linalg.svd(dummy)
+            except Exception:
+                pass
+
+
 def evaluate_set(graphs, models, baselines, polish=True, label=""):
     import concurrent.futures, threading
     rows, preds = [], {}
     n_graphs = len(graphs)
     
+    # Warm up cuSOLVER sequentially on all GPUs to prevent lazy wrapper race condition
+    warmup_cuda(DEVICES)
+
     # Pre-build baselines per device for round-robin GPU dispatch
     base_per_dev = {dev: BL.get_baselines(C, device=dev) for dev in DEVICES}
     gpu_methods = {
+        "MDS-MAP", "MDS-MAP + stress (L-BFGS)", "MDS-MAP + Huber stress",
         "DV-distance + dwMDS (no learning)", "Classical MDS (direct)",
         "Rank Alternation (EDM book Alg 2)", "OptSpace (EDM book Alg 3)",
         "Alternating Descent (EDM book Alg 4)", "Yan et al. GCN (3 anchor labels)",
@@ -163,15 +178,18 @@ def evaluate_set(graphs, models, baselines, polish=True, label=""):
         print(f"{label} [Model] '{name}' done -> Mean RMSE: {m_rmse:.4f} ({sec*1000:.1f} ms/graph)", flush=True)
 
         if polish and (name == OURS or name.startswith(TRANSFER)):
-            n_cpu_workers = min(os.cpu_count() or 4, 8)
-            print(f"{label} [Polish] Running Huber L-BFGS polish on {n_graphs} graphs (parallel across {n_cpu_workers} CPU workers)...", flush=True)
+            use_gpu_pol = len(DEVICES) >= 1 and DEVICES[0] != "cpu"
+            worker_count = len(DEVICES) if len(DEVICES) >= 2 else (1 if use_gpu_pol else min(os.cpu_count() or 4, 8))
+            mode_str = f"Dual-GPU parallel ({', '.join(DEVICES)})" if len(DEVICES) >= 2 else (DEVICE if use_gpu_pol else f"Multi-core CPU ({worker_count} workers)")
+            print(f"{label} [Polish] Running Huber L-BFGS polish on {n_graphs} graphs [{mode_str}]...", flush=True)
             t_pol_start = time.time()
             log_step = max(1, n_graphs // 5)
             
             def polish_one(item):
                 idx, g, X = item
+                dev = DEVICES[idx % len(DEVICES)] if use_gpu_pol else "cpu"
                 t0 = time.perf_counter()
-                Y = BL.stress_lbfgs(g, X, robust=True)
+                Y = BL.stress_lbfgs(g, X, robust=True, device=dev)
                 dur = time.perf_counter() - t0
                 return idx, Y, dur
 
@@ -180,7 +198,7 @@ def evaluate_set(graphs, models, baselines, polish=True, label=""):
             completed = 0
             print_lock = threading.Lock()
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=n_cpu_workers) as pool:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as pool:
                 futures = [pool.submit(polish_one, (idx, g, X)) for idx, (g, X) in enumerate(zip(graphs, P))]
                 for f in concurrent.futures.as_completed(futures):
                     idx, Y, dur = f.result()
@@ -201,9 +219,17 @@ def evaluate_set(graphs, models, baselines, polish=True, label=""):
     # 2. Baselines
     n_base = len(baselines)
     for b_idx, (name, fn) in enumerate(baselines.items(), 1):
-        is_gpu = name in gpu_methods and len(DEVICES) >= 2
-        worker_count = len(DEVICES) if is_gpu else (min(os.cpu_count() or 4, 8) if name not in gpu_methods else 1)
-        mode_str = f"Dual-GPU parallel ({', '.join(DEVICES)})" if is_gpu else (f"Multi-core CPU ({worker_count} workers)" if name not in gpu_methods else DEVICE)
+        is_gpu = (name in gpu_methods) and (DEVICES[0] != "cpu")
+        if is_gpu and len(DEVICES) >= 2:
+            worker_count = len(DEVICES)
+            mode_str = f"Dual-GPU parallel ({', '.join(DEVICES)})"
+        elif is_gpu:
+            worker_count = 1
+            mode_str = DEVICE
+        else:
+            worker_count = min(os.cpu_count() or 4, 8)
+            mode_str = f"Multi-core CPU ({worker_count} workers)"
+
         print(f"\n{label} [{b_idx}/{n_base}] Baseline: '{name}' on {n_graphs} graphs [{mode_str}]...", flush=True)
         t0 = time.time()
         P = [None] * n_graphs
@@ -238,6 +264,7 @@ def evaluate_set(graphs, models, baselines, polish=True, label=""):
         print(f"{label} [{b_idx}/{n_base}] '{name}' completed in {time.time() - t0:.1f}s -> Mean RMSE: {b_rmse:.4f}", flush=True)
 
     return pd.DataFrame(rows), preds
+
 
 
 

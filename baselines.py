@@ -50,13 +50,34 @@ def procrustes_O2(X, anchors, A):
     return (X - sc) @ best.T + ac
 
 
+def geodesic_matrix_torch(n, E, d, device="cpu"):
+    dev = torch.device(device if (device != "cpu" and torch.cuda.is_available()) else "cpu")
+    D = torch.full((n, n), float("inf"), dtype=torch.float32, device=dev)
+    D.fill_diagonal_(0.0)
+    src = torch.as_tensor(E[:, 0], dtype=torch.long, device=dev)
+    dst = torch.as_tensor(E[:, 1], dtype=torch.long, device=dev)
+    dd = torch.as_tensor(d, dtype=torch.float32, device=dev)
+    D[src, dst] = dd
+    D[dst, src] = dd
+    for k in range(n):
+        D = torch.minimum(D, D[:, k:k+1] + D[k:k+1, :])
+    return D
+
+
 def classical_mds_torch(D, d=2, device="cpu"):
     n = D.shape[0]
     dev = torch.device(device if (device != "cpu" and torch.cuda.is_available()) else "cpu")
     Dt = torch.as_tensor(D, dtype=torch.float32, device=dev)
     J = torch.eye(n, device=dev) - (1.0 / n)
     B = -0.5 * J @ (Dt ** 2) @ J
-    w, V = torch.linalg.eigh((B + B.T) / 2)
+    sym_B = (B + B.T) / 2
+    try:
+        w, V = torch.linalg.eigh(sym_B)
+    except Exception:
+        # cuSOLVER lazy wrapper race condition or CUDA exception -> fallback to numpy
+        w_np, V_np = np.linalg.eigh(sym_B.detach().cpu().numpy())
+        w = torch.as_tensor(w_np, device=dev)
+        V = torch.as_tensor(V_np, device=dev)
     idx = torch.arange(n - 1, n - d - 1, -1, device=dev)
     val = torch.clamp(w[idx], min=0.0)
     X = V[:, idx] * torch.sqrt(val)
@@ -71,7 +92,12 @@ def procrustes_torch(X, anchors, A, device="cpu"):
     sc = S.mean(0)
     ac = At.mean(0)
     H = (S - sc).T @ (At - ac)
-    U, _, Vt = torch.linalg.svd(H)
+    try:
+        U, _, Vt = torch.linalg.svd(H)
+    except Exception:
+        U_np, _, Vt_np = np.linalg.svd(H.detach().cpu().numpy())
+        U = torch.as_tensor(U_np, device=dev)
+        Vt = torch.as_tensor(Vt_np, device=dev)
     best_R = None
     best_err = float("inf")
     for sg in (1.0, -1.0):
@@ -91,8 +117,53 @@ def _pin(g, X):
     X = X.copy(); X[g["anchors"]] = g["anchor_xy"]; return X
 
 
-def stress_lbfgs(g, X0, robust=False, max_iter=3000):
-    """Minimise sum_edges rho(||x_i - x_j|| - d_ij) over NON-anchor nodes."""
+def stress_lbfgs(g, X0, robust=False, max_iter=100, device="cpu"):
+    """Minimise sum_edges rho(||x_i - x_j|| - d_ij) over NON-anchor nodes on GPU/CPU."""
+    if device != "cpu" and torch.cuda.is_available():
+        dev = torch.device(device)
+        n, E, d = g["n"], g["edges"], g["d_obs"].astype(np.float32)
+        src = torch.as_tensor(E[:, 0], dtype=torch.long, device=dev)
+        dst = torch.as_tensor(E[:, 1], dtype=torch.long, device=dev)
+        dt = torch.as_tensor(d, dtype=torch.float32, device=dev)
+        anc = torch.as_tensor(g["anchors"], dtype=torch.long, device=dev)
+        axy = torch.as_tensor(g["anchor_xy"], dtype=torch.float32, device=dev)
+
+        is_free = torch.ones(n, dtype=torch.bool, device=dev)
+        is_free[anc] = False
+        free_idx = torch.nonzero(is_free).squeeze(-1)
+
+        X_init = torch.as_tensor(X0, dtype=torch.float32, device=dev)
+        X_free = torch.nn.Parameter(X_init[free_idx].clone())
+        optimizer = torch.optim.LBFGS([X_free], max_iter=max_iter, lr=1.0, line_search_fn="strong_wolfe")
+        delta = 0.1 * float(np.median(d))
+
+        def closure():
+            optimizer.zero_grad()
+            X_full = torch.zeros((n, 2), dtype=torch.float32, device=dev)
+            X_full[anc] = axy
+            X_full[free_idx] = X_free
+            diff = X_full[src] - X_full[dst]
+            dhat = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-12)
+            r = dhat - dt
+            if robust:
+                a = r.abs()
+                loss = torch.where(a <= delta, 0.5 * (r ** 2), delta * (a - 0.5 * delta)).sum()
+            else:
+                loss = (r ** 2).sum()
+            loss.backward()
+            return loss
+
+        try:
+            optimizer.step(closure)
+        except Exception:
+            pass
+
+        X_final = torch.zeros((n, 2), dtype=torch.float32, device=dev)
+        X_final[anc] = axy
+        X_final[free_idx] = X_free.detach()
+        return X_final.cpu().numpy()
+
+    # CPU scipy fallback
     n, E, d = g["n"], g["edges"], g["d_obs"].astype(float)
     I, J = E[:, 0], E[:, 1]
     free = np.ones(n, bool); free[g["anchors"]] = False
@@ -124,18 +195,25 @@ def stress_lbfgs(g, X0, robust=False, max_iter=3000):
 # -----------------------------------------------------------------------------
 # baselines
 # -----------------------------------------------------------------------------
-def mds_map(g):
+def mds_map(g, device="cpu"):
+    if device != "cpu" and torch.cuda.is_available():
+        dev = torch.device(device)
+        D = geodesic_matrix_torch(g["n"], g["edges"], g["d_obs"], device=dev)
+        D = torch.nan_to_num(D, posinf=100.0)
+        X = classical_mds_torch(D, d=2, device=dev)
+        return _pin(g, procrustes_torch(X, g["anchors"], g["anchor_xy"], device=dev).cpu().numpy())
     D = geodesic_matrix(g["n"], g["edges"], g["d_obs"].astype(float))
     X = classical_mds(D)
     return _pin(g, procrustes_O2(X, g["anchors"], g["anchor_xy"]))
 
 
-def mds_map_stress(g):
-    return stress_lbfgs(g, mds_map(g), robust=False)
+def mds_map_stress(g, device="cpu"):
+    return stress_lbfgs(g, mds_map(g, device=device), robust=False, device=device)
 
 
-def mds_map_huber(g):
-    return stress_lbfgs(g, mds_map(g), robust=True)
+def mds_map_huber(g, device="cpu"):
+    return stress_lbfgs(g, mds_map(g, device=device), robust=True, device=device)
+
 
 
 def dv_dwmds(g, iters=300, alpha=0.5, device="cpu"):
@@ -208,16 +286,17 @@ def sdp_biswas_ye(g, device="cpu"):
         use_gpu = (device != "cpu" and torch.cuda.is_available())
         try:
             if use_gpu:
-                prob.solve(solver=cp.SCS, max_iters=5000, eps=1e-5, verbose=False, gpu=True)
+                prob.solve(solver=cp.SCS, max_iters=1000, eps=1e-3, verbose=False, gpu=True)
             else:
-                prob.solve(solver=cp.SCS, max_iters=5000, eps=1e-5, verbose=False)
+                prob.solve(solver=cp.SCS, max_iters=1000, eps=1e-3, verbose=False)
         except Exception:
-            prob.solve(solver=cp.SCS, max_iters=5000, eps=1e-5, verbose=False)
+            prob.solve(solver=cp.SCS, max_iters=1000, eps=1e-3, verbose=False)
         Xu = np.asarray(Z.value[:2, 2:]).T
     except Exception:
-        return mds_map(g)
+        return mds_map(g, device=device)
     X = np.zeros((n, 2)); X[unk] = Xu
     return _pin(g, X)
+
 
 
 def yan_gcn(g, epochs=200, hidden=256, lr=0.01, dropout=0.5, seed=0, device="cpu"):
@@ -320,7 +399,13 @@ def rank_complete_edm(g, max_iters=100, tol=1e-5, device="cpu"):
     D_cur.fill_diagonal_(0.0)
     r = 4  # rank d+2
     for _ in range(max_iters):
-        w, V = torch.linalg.eigh((D_cur + D_cur.T) / 2)
+        sym_D = (D_cur + D_cur.T) / 2
+        try:
+            w, V = torch.linalg.eigh(sym_D)
+        except Exception:
+            w_np, V_np = np.linalg.eigh(sym_D.detach().cpu().numpy())
+            w = torch.as_tensor(w_np, device=dev)
+            V = torch.as_tensor(V_np, device=dev)
         idx = torch.topk(w.abs(), r).indices
         D_next = (V[:, idx] * w[idx]) @ V[:, idx].T
         D_next[W] = D2[W]
@@ -357,7 +442,13 @@ def optspace_edm(g, rank=4, device="cpu"):
     if trim_mask.any():
         M_trimmed[trim_mask, :] = 0.0
         M_trimmed[:, trim_mask] = 0.0
-    U, s, Vt = torch.linalg.svd(M_trimmed, full_matrices=False)
+    try:
+        U, s, Vt = torch.linalg.svd(M_trimmed, full_matrices=False)
+    except Exception:
+        U_np, s_np, Vt_np = np.linalg.svd(M_trimmed.detach().cpu().numpy(), full_matrices=False)
+        U = torch.as_tensor(U_np, device=dev)
+        s = torch.as_tensor(s_np, device=dev)
+        Vt = torch.as_tensor(Vt_np, device=dev)
     U_r, s_r, Vt_r = U[:, :rank], s[:rank], Vt[:rank, :]
     D_est = U_r @ torch.diag(s_r) @ Vt_r
     D_est[W] = D2[W]
@@ -404,9 +495,9 @@ def alternating_descent(g, max_iters=50, device="cpu"):
 
 def get_baselines(cfg, device="cpu"):
     B = {
-        "MDS-MAP": mds_map,
-        "MDS-MAP + stress (L-BFGS)": mds_map_stress,
-        "MDS-MAP + Huber stress": mds_map_huber,
+        "MDS-MAP": lambda g: mds_map(g, device=device),
+        "MDS-MAP + stress (L-BFGS)": lambda g: mds_map_stress(g, device=device),
+        "MDS-MAP + Huber stress": lambda g: mds_map_huber(g, device=device),
         "DV-distance + dwMDS (no learning)": lambda g: dv_dwmds(g, device=device),
         "Classical MDS (direct)": lambda g: naive_classical_mds(g, device=device),
         "Rank Alternation (EDM book Alg 2)": lambda g: rank_complete_edm(g, device=device),
