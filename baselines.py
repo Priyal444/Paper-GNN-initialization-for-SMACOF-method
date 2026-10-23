@@ -117,53 +117,9 @@ def _pin(g, X):
     X = X.copy(); X[g["anchors"]] = g["anchor_xy"]; return X
 
 
-def stress_lbfgs(g, X0, robust=False, max_iter=100, device="cpu"):
-    """Minimise sum_edges rho(||x_i - x_j|| - d_ij) over NON-anchor nodes on GPU/CPU."""
-    if device != "cpu" and torch.cuda.is_available():
-        dev = torch.device(device)
-        n, E, d = g["n"], g["edges"], g["d_obs"].astype(np.float32)
-        src = torch.as_tensor(E[:, 0], dtype=torch.long, device=dev)
-        dst = torch.as_tensor(E[:, 1], dtype=torch.long, device=dev)
-        dt = torch.as_tensor(d, dtype=torch.float32, device=dev)
-        anc = torch.as_tensor(g["anchors"], dtype=torch.long, device=dev)
-        axy = torch.as_tensor(g["anchor_xy"], dtype=torch.float32, device=dev)
-
-        is_free = torch.ones(n, dtype=torch.bool, device=dev)
-        is_free[anc] = False
-        free_idx = torch.nonzero(is_free).squeeze(-1)
-
-        X_init = torch.as_tensor(X0, dtype=torch.float32, device=dev)
-        X_free = torch.nn.Parameter(X_init[free_idx].clone())
-        optimizer = torch.optim.LBFGS([X_free], max_iter=max_iter, lr=1.0, line_search_fn="strong_wolfe")
-        delta = 0.1 * float(np.median(d))
-
-        def closure():
-            optimizer.zero_grad()
-            X_full = torch.zeros((n, 2), dtype=torch.float32, device=dev)
-            X_full[anc] = axy
-            X_full[free_idx] = X_free
-            diff = X_full[src] - X_full[dst]
-            dhat = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-12)
-            r = dhat - dt
-            if robust:
-                a = r.abs()
-                loss = torch.where(a <= delta, 0.5 * (r ** 2), delta * (a - 0.5 * delta)).sum()
-            else:
-                loss = (r ** 2).sum()
-            loss.backward()
-            return loss
-
-        try:
-            optimizer.step(closure)
-        except Exception:
-            pass
-
-        X_final = torch.zeros((n, 2), dtype=torch.float32, device=dev)
-        X_final[anc] = axy
-        X_final[free_idx] = X_free.detach()
-        return X_final.cpu().numpy()
-
-    # CPU scipy fallback
+def stress_lbfgs(g, X0, robust=False, max_iter=3000, device="cpu"):
+    """Minimise sum_edges rho(||x_i - x_j|| - d_ij) over NON-anchor nodes.
+    Uses compiled C/Fortran L-BFGS-B (10x faster than GPU for small 94-variable graphs)."""
     n, E, d = g["n"], g["edges"], g["d_obs"].astype(float)
     I, J = E[:, 0], E[:, 1]
     free = np.ones(n, bool); free[g["anchors"]] = False
@@ -196,23 +152,18 @@ def stress_lbfgs(g, X0, robust=False, max_iter=100, device="cpu"):
 # baselines
 # -----------------------------------------------------------------------------
 def mds_map(g, device="cpu"):
-    if device != "cpu" and torch.cuda.is_available():
-        dev = torch.device(device)
-        D = geodesic_matrix_torch(g["n"], g["edges"], g["d_obs"], device=dev)
-        D = torch.nan_to_num(D, posinf=100.0)
-        X = classical_mds_torch(D, d=2, device=dev)
-        return _pin(g, procrustes_torch(X, g["anchors"], g["anchor_xy"], device=dev).cpu().numpy())
     D = geodesic_matrix(g["n"], g["edges"], g["d_obs"].astype(float))
     X = classical_mds(D)
     return _pin(g, procrustes_O2(X, g["anchors"], g["anchor_xy"]))
 
 
 def mds_map_stress(g, device="cpu"):
-    return stress_lbfgs(g, mds_map(g, device=device), robust=False, device=device)
+    return stress_lbfgs(g, mds_map(g), robust=False)
 
 
 def mds_map_huber(g, device="cpu"):
-    return stress_lbfgs(g, mds_map(g, device=device), robust=True, device=device)
+    return stress_lbfgs(g, mds_map(g), robust=True)
+
 
 
 
@@ -328,6 +279,165 @@ def yan_gcn(g, epochs=200, hidden=256, lr=0.01, dropout=0.5, seed=0, device="cpu
         opt.zero_grad(); loss = F.mse_loss(fwd(True)[a], ya); loss.backward(); opt.step()
     with torch.no_grad():
         return _pin(g, fwd(False).cpu().numpy())
+
+
+class _MPNNLocNet(nn.Module):
+    """
+    MPNN-Loc Architecture from:
+    Xu & Lin (IFAC 2025): 'Graph Neural Network based Localization for Layout-Agnostic Sensor Networks'
+    """
+    def __init__(self, n, in_dim=2, hidden=200, dropout=0.5):
+        super().__init__()
+        self.n = n
+        self.dropout = dropout
+        
+        # Layer 1: t=1, M^1 dimension = 2 * in_dim + 1 = 5
+        m1_dim = 2 * in_dim + 1
+        self.W_node1 = nn.Linear(m1_dim, hidden)
+        self.W_edge1 = nn.Linear(m1_dim, n)
+        
+        # Layer 2: Readout at t=Tl=2, M^2 dimension = 2 * hidden + 1 = 401
+        m2_dim = 2 * hidden + 1
+        self.W_readout = nn.Linear(m2_dim, 2)
+
+    def forward(self, H0, E0, A_hat):
+        # A_hat: row-normalized adjacency matrix (N, N)
+        # H0: initial node features (N, 2)
+        # E0: initial edge distance matrix (N, N)
+        
+        # --- Layer 1 ---
+        AE0_diag = torch.diagonal(A_hat @ E0).unsqueeze(-1)
+        M1 = torch.cat([H0, A_hat @ H0, AE0_diag], dim=-1)   # (N, 5)
+        
+        # Node update (Eq. 11)
+        H1 = F.relu(self.W_node1(M1))
+        H1 = F.dropout(H1, p=self.dropout, training=self.training)
+        
+        # Edge update (Eq. 12)
+        E1_raw = self.W_edge1(M1)                            # (N, N)
+        E1 = F.relu(A_hat * E1_raw)                          # Hadamard product A_hat \odot (...)
+        
+        # --- Layer 2 / Readout (Eq. 10 & 13) ---
+        AE1_diag = torch.diagonal(A_hat @ E1).unsqueeze(-1)
+        M2 = torch.cat([H1, A_hat @ H1, AE1_diag], dim=-1)   # (N, 2*hidden + 1)
+        
+        P_hat = self.W_readout(M2)                           # (N, 2)
+        return P_hat
+
+
+def _correlation_refinement(P_hat, P_L, A, anchors, agents, dev):
+    """
+    Correlation-based refinement module (Eq. 14-17 in Xu & Lin, IFAC 2025).
+    P'_U = P_hat_U - Gamma_UU^{-1} Gamma_UL (P_L - P_hat_L)
+    where Gamma = I - K^{-1/2} A K^{-1/2} is the symmetric normalized Laplacian.
+    """
+    n = A.shape[0]
+    deg = A.sum(dim=-1)
+    deg_inv_sqrt = torch.where(deg > 0, 1.0 / torch.sqrt(deg), torch.zeros_like(deg))
+    A_sym = deg_inv_sqrt.unsqueeze(-1) * A * deg_inv_sqrt.unsqueeze(0)
+    Gamma = torch.eye(n, device=dev) - A_sym
+    
+    # Submatrices
+    Gamma_UU = Gamma[agents][:, agents]
+    Gamma_UL = Gamma[agents][:, anchors]
+    
+    # Anchors difference: (P_L - P_hat_L)
+    diff_L = P_L - P_hat[anchors]
+    rhs = Gamma_UL @ diff_L                                # (N_agents, 2)
+    
+    # Regularized solve for numerical stability
+    reg = 1e-4 * torch.eye(len(agents), device=dev)
+    try:
+        delta_U = torch.linalg.solve(Gamma_UU + reg, rhs)
+    except Exception:
+        delta_U = torch.linalg.lstsq(Gamma_UU + reg, rhs).solution
+        
+    P_refined = P_hat.clone()
+    P_refined[agents] = P_hat[agents] - delta_U
+    P_refined[anchors] = P_L
+    return P_refined
+
+
+def mpnn_loc(g, epochs=200, hidden=200, lr=0.001, dropout=0.5, refine=True, seed=0, device="cpu"):
+    """
+    MPNN-Loc algorithm from Xu & Lin (IFAC 2025):
+    'Graph Neural Network based Localization for Layout-Agnostic Sensor Networks'
+    
+    Consists of:
+    1. Node feature initialization (anchor coords, nearest-anchor coords, or area center)
+    2. 2-layer MPNN with joint node & edge updates
+    3. Semi-supervised training minimizing MSE on anchor predictions
+    4. Nonparametric correlation-based refinement using symmetric normalized Laplacian
+    """
+    torch.manual_seed(seed)
+    dev = torch.device(device if (device != "cpu" and torch.cuda.is_available()) else "cpu")
+    
+    n = g["n"]
+    E = g["edges"]
+    d = g["d_obs"].astype(np.float32)
+    anchors_list = list(g["anchors"])
+    anchors = torch.tensor(anchors_list, dtype=torch.long, device=dev)
+    agents_list = [i for i in range(n) if i not in anchors_list]
+    agents = torch.tensor(agents_list, dtype=torch.long, device=dev)
+    P_L = torch.tensor(g["anchor_xy"], dtype=torch.float32, device=dev)
+    
+    # 1. Adjacency and Distance Matrices
+    A_np = np.zeros((n, n), dtype=np.float32)
+    D_np = np.zeros((n, n), dtype=np.float32)
+    A_np[E[:, 0], E[:, 1]] = 1.0
+    A_np[E[:, 1], E[:, 0]] = 1.0
+    D_np[E[:, 0], E[:, 1]] = d
+    D_np[E[:, 1], E[:, 0]] = d
+    
+    # Row-normalized adjacency A_hat = K^{-1} A (Eq. 3, page 3)
+    k_np = np.maximum(A_np.sum(axis=1, keepdims=True), 1e-6)
+    A_hat_np = A_np / k_np
+    
+    A = torch.tensor(A_np, device=dev)
+    A_hat = torch.tensor(A_hat_np, device=dev)
+    E0 = torch.tensor(D_np, device=dev)
+    
+    # 2. Node feature initialization X (Eq. 5-9)
+    # Anchor: X_i = P_i
+    # Agent: X_i = P_vina if connected to any anchor, else P_center
+    P_center = g["anchor_xy"].mean(axis=0)
+    X_init = np.tile(P_center, (n, 1)).astype(np.float32)
+    for a_idx, a_node in enumerate(anchors_list):
+        X_init[a_node] = g["anchor_xy"][a_idx]
+        
+    for ag in agents_list:
+        anc_nbrs = [nbr for nbr in anchors_list if A_np[ag, nbr] > 0]
+        if anc_nbrs:
+            vina = min(anc_nbrs, key=lambda a_nbr: D_np[ag, a_nbr])
+            vina_idx = anchors_list.index(vina)
+            X_init[ag] = g["anchor_xy"][vina_idx]
+            
+    H0 = torch.tensor(X_init, device=dev)
+    
+    # 3. Model & Optimizer
+    model = _MPNNLocNet(n, in_dim=2, hidden=hidden, dropout=dropout).to(dev)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    
+    # 4. Training (Eq. 18: loss = MSE(P_hat_L, P_L))
+    model.train()
+    for _ in range(epochs):
+        optimizer.zero_grad()
+        P_hat = model(H0, E0, A_hat)
+        loss = F.mse_loss(P_hat[anchors], P_L)
+        loss.backward()
+        optimizer.step()
+        
+    # 5. Inference & Correlation-based refinement (Eq. 14-17)
+    model.eval()
+    with torch.no_grad():
+        P_hat = model(H0, E0, A_hat)
+        if refine:
+            P_out = _correlation_refinement(P_hat, P_L, A, anchors, agents, dev)
+        else:
+            P_out = P_hat
+            P_out[anchors] = P_L
+        
+    return P_out.cpu().numpy()
 
 
 class _SAGE(nn.Module):
@@ -459,9 +569,12 @@ def optspace_edm(g, rank=4, device="cpu"):
     return procrustes_torch(X, g["anchors"], g["anchor_xy"], device=dev).cpu().numpy()
 
 
-def alternating_descent(g, max_iters=50, device="cpu"):
-    """Dokmanic et al. Algorithm 4: Alternating Descent on s-stress."""
+def alternating_descent(g, max_iters=50, seed=0, device="cpu"):
+    """Dokmanic et al. Algorithm 4: Alternating Descent on s-stress.
+    Fixed initialization: uses small Gaussian perturbation around anchor centroid
+    instead of all-zeros to avoid the zero-gradient saddle point at iteration 0."""
     dev = torch.device(device if (device != "cpu" and torch.cuda.is_available()) else "cpu")
+    torch.manual_seed(seed)
     n, E, d = g["n"], g["edges"], g["d_obs"].astype(np.float32)
     src = torch.as_tensor(E[:, 0], dtype=torch.long, device=dev)
     dst = torch.as_tensor(E[:, 1], dtype=torch.long, device=dev)
@@ -471,7 +584,8 @@ def alternating_descent(g, max_iters=50, device="cpu"):
     is_free = torch.ones(n, dtype=torch.bool, device=dev)
     is_free[anc] = False
     free_idx = torch.nonzero(is_free).squeeze(-1)
-    X_free = torch.nn.Parameter(torch.zeros((len(free_idx), 2), dtype=torch.float32, device=dev))
+    init_xy = axy.mean(0, keepdim=True) + 0.1 * torch.randn((len(free_idx), 2), dtype=torch.float32, device=dev)
+    X_free = torch.nn.Parameter(init_xy)
     optimizer = torch.optim.LBFGS([X_free], max_iter=max_iters, lr=1.0, line_search_fn="strong_wolfe")
     def closure():
         optimizer.zero_grad()
@@ -505,6 +619,10 @@ def get_baselines(cfg, device="cpu"):
         "Alternating Descent (EDM book Alg 4)": lambda g: alternating_descent(g, device=device),
         "Yan et al. GCN (3 anchor labels)": lambda g: yan_gcn(g, epochs=cfg.YAN_GCN_EPOCHS, device=device),
     }
+    if getattr(cfg, "RUN_MPNN_LOC", True):
+        B["MPNN-Loc (Xu & Lin 2025)"] = lambda g: mpnn_loc(
+            g, epochs=getattr(cfg, "MPNN_LOC_EPOCHS", 200), device=device
+        )
     if cfg.RUN_SDP:
         B["SDP (Biswas-Ye)"] = lambda g: sdp_biswas_ye(g, device=device)
     if cfg.RUN_PERGRAPH_SAGE:

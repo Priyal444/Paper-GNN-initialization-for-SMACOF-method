@@ -1,20 +1,13 @@
 """
 common.py -- shared building blocks used by step1 / step2 / step3.
 
-    1. geometry           : points, distance matrices
-    2. graph generators   : random (spanning tree + extra edges), RGG, BA
+    1. geometry           : points, distance matrices, E(2) canonical anchor frame
+    2. graph generators   : random (spanning tree + extra edges), RGG (MST-first), BA
     3. noise              : multiplicative Gaussian + positive NLOS bias
     4. anchors            : well-spread anchor selection
     5. rigidity           : is the answer even unique?  (graph + per node)
-    6. features           : everything the GNN is allowed to see
+    6. features           : E(2)-equivariant features (supports any K >= 3 anchors)
     7. metrics            : coordinate RMSE, certified RMSE, relative EDM error
-
-GOAL COMPLIANCE
-    The GNN and every baseline see ONLY: the observed (noisy) distances on
-    the observed edges + the coordinates of the anchor nodes.
-    Ground-truth coordinates of non-anchor nodes are stored in the dataset
-    ONLY for (a) the supervised training loss on synthetic TRAINING graphs and
-    (b) scoring. They never enter the features of any graph.
 """
 import numpy as np
 import networkx as nx
@@ -23,7 +16,7 @@ from scipy.sparse.csgraph import shortest_path, minimum_spanning_tree
 
 
 # =============================================================================
-# 1. Geometry
+# 1. Geometry & E(2) Canonical Frame
 # =============================================================================
 def random_points(n, rng, coord_range=10.0):
     """n points uniform in [-R, R]^2, shape (n, 2)."""
@@ -34,6 +27,52 @@ def dist_matrix(P):
     """Raw (NOT squared) Euclidean distance matrix of points P (n, 2)."""
     diff = P[:, None, :] - P[None, :, :]
     return np.sqrt((diff ** 2).sum(-1))
+
+
+def best_anchor_triangle(anchor_xy):
+    """If K > 3 anchors are given, pick the 3 anchors with the largest triangle area
+    to define a well-conditioned canonical coordinate frame."""
+    K = len(anchor_xy)
+    if K == 3:
+        return np.array([0, 1, 2], dtype=np.int64)
+    best_tri, best_area = (0, 1, 2), -1.0
+    for a in range(K):
+        for b in range(a + 1, K):
+            for c in range(b + 1, K):
+                u = anchor_xy[b] - anchor_xy[a]
+                v = anchor_xy[c] - anchor_xy[a]
+                area = abs(u[0] * v[1] - u[1] * v[0]) * 0.5
+                if area > best_area:
+                    best_area = area
+                    best_tri = (a, b, c)
+    return np.array(best_tri, dtype=np.int64)
+
+
+def canonical_anchor_frame(anchor_xy):
+    """
+    Constructs an exact E(2)-equivariant canonical coordinate frame from K >= 3 anchors:
+      1. Translation: origin = centroid c of the 3 reference anchors
+      2. Scale: unit = mean pairwise distance s of the 3 reference anchors
+      3. Rotation: align vector (anchor_1 - anchor_0) with positive x-axis
+      4. Reflection: flip y-axis so anchor_2 lies in the upper half-plane (y >= 0)
+    Returns (c, s, R, tri) where R is a (2, 2) orthogonal matrix in O(2) such that:
+      X_can = ((X_orig - c) / s) @ R
+      X_orig = (X_can @ R.T) * s + c
+    """
+    tri = best_anchor_triangle(anchor_xy)
+    A3 = anchor_xy[tri].astype(np.float64)
+    c = A3.mean(0)
+    s = np.mean([np.linalg.norm(A3[i] - A3[j]) for i in range(3) for j in range(i + 1, 3)])
+    s = max(float(s), 1e-6)
+    A_s = (A3 - c) / s
+    u = A_s[1] - A_s[0]
+    norm_u = np.linalg.norm(u)
+    e1 = u / norm_u if norm_u > 1e-9 else np.array([1.0, 0.0])
+    e2 = np.array([-e1[1], e1[0]])
+    if np.dot(A_s[2] - A_s[0], e2) < 0:
+        e2 = -e2
+    R = np.column_stack([e1, e2])
+    return c.astype(np.float32), np.float32(s), R.astype(np.float32), tri
 
 
 # =============================================================================
@@ -50,8 +89,6 @@ def graph_random(n, missing, rng):
       1. random spanning tree: node order is shuffled and each node attaches
          to a uniformly random earlier node   -> connected, n-1 edges
       2. add uniformly random extra pairs until the target edge count.
-    Much faster than "delete an edge, check connectivity, undo", and the graph
-    is connected by construction.  NOTE: connected != rigid (see rigidity()).
     """
     order = rng.permutation(n)
     edges = set()
@@ -70,27 +107,29 @@ def graph_random(n, missing, rng):
 
 def graph_rgg(P, missing):
     """
-    Random geometric (radio-range) graph: keep the SHORTEST pairs until the
-    target edge count, then add the Euclidean minimum spanning tree so the
-    graph is connected (only short links are ever added).
+    Random geometric (radio-range) graph:
+      1. Start with the Euclidean minimum spanning tree (n-1 edges) so the graph
+         is guaranteed connected.
+      2. Add the shortest remaining pairs until the exact target edge count is reached.
     """
     n = len(P)
     D = dist_matrix(P)
-    iu = np.triu_indices(n, 1)
-    order = np.argsort(D[iu])
-    target = _target_edges(n, missing)
-    keep = order[:target]
-    edges = set(zip(iu[0][keep].tolist(), iu[1][keep].tolist()))
     mst = minimum_spanning_tree(csr_matrix(D)).tocoo()
+    edges = set()
     for a, b in zip(mst.row, mst.col):
         edges.add((int(min(a, b)), int(max(a, b))))
+    target = _target_edges(n, missing)
+    iu = np.triu_indices(n, 1)
+    order = np.argsort(D[iu])
+    for idx in order:
+        if len(edges) >= target:
+            break
+        edges.add((int(iu[0][idx]), int(iu[1][idx])))
     return np.array(sorted(edges), dtype=np.int64)
 
 
 def ba_m_for(n, missing):
-    """m whose BA edge count m*(n-m) is closest to the target for this missing %.
-    BA has at most n^2/4 edges (m = n/2), so it cannot go below ~50 % missing;
-    low missing levels are capped at m = n // 2."""
+    """m whose BA edge count m*(n-m) is closest to the target for this missing %."""
     target = _target_edges(n, missing)
     ms = np.arange(1, n // 2 + 1)
     return int(ms[np.argmin(np.abs(ms * (n - ms) - target))])
@@ -104,10 +143,7 @@ def ba_reachable(n, missing, tol=0.05):
 
 
 def graph_ba(n, m, rng):
-    """Barabasi-Albert graph: each new node attaches to m existing nodes.
-    m = 1 is a tree (never rigid), m = 2 gives flip ambiguities, m >= 3 is
-    close to a trilateration construction (usually uniquely localisable).
-    Edge count is m * (n - m) (networkx starts from a star on m + 1 nodes)."""
+    """Barabasi-Albert graph: each new node attaches to m existing nodes."""
     G = nx.barabasi_albert_graph(n, m, seed=int(rng.integers(1 << 31)))
     e = np.array([(min(a, b), max(a, b)) for a, b in G.edges()], dtype=np.int64)
     return e
@@ -137,8 +173,7 @@ def noisy_distances(d_true, rng, sigma=0.0, p_nlos=0.0, nlos_max=0.0):
 # =============================================================================
 def pick_anchors(P, k, rng, tries=60):
     """k anchors, chosen among `tries` random k-subsets to maximise the
-    smallest triangle area (well-spread, never collinear). In a deployment
-    you PLACE anchors, so choosing them is part of the experimental design."""
+    smallest triangle area (well-spread, never collinear)."""
     n = len(P)
     best, best_score = None, -1.0
     for _ in range(tries):
@@ -170,24 +205,14 @@ def _trilaterate_from(Adj, seed):
 
 
 def trilateration_certified(n, edges, anchors, max_seeds=3000, rng=None):
-    """
-    Per-node SUFFICIENT certificate of unique localisability (generic positions).
-      * Growing a set by trilateration (each new node has >= 3 neighbours
-        already in the set) from a triangle gives a globally rigid subgraph.
-      * Two globally rigid subgraphs sharing >= 3 nodes form a globally rigid
-        union, so every grown set that contains all 3 anchors is pinned down
-        uniquely by the anchors.
-    certified = union of those sets (anchors themselves are seeds too).
-    Nodes left uncertified MAY still be unique -- the certificate is one-sided.
-    """
+    """Per-node SUFFICIENT certificate of unique localisability (generic positions)."""
     Adj = np.zeros((n, n), np.int32)
     Adj[edges[:, 0], edges[:, 1]] = 1
     Adj[edges[:, 1], edges[:, 0]] = 1
     anchors = list(anchors)
     cert = np.zeros(n, bool)
-    comp = _trilaterate_from(Adj, anchors)          # seed = the anchor triangle
+    comp = _trilaterate_from(Adj, anchors)
     cert |= comp
-    # seeds = triangles of the measurement graph
     tris = []
     for i, j in edges:
         for k in np.nonzero(Adj[i] & Adj[j])[0]:
@@ -207,13 +232,7 @@ def trilateration_certified(n, edges, anchors, max_seeds=3000, rng=None):
 
 
 def globally_rigid(n, edges, anchors, rng, d=2, tol=1e-8):
-    """
-    Randomised generic GLOBAL rigidity test (Gortler-Healy-Thurston 2010).
-    Anchors are joined into a clique (their mutual distances are known).
-    G is generically globally rigid in R^d  <=>  for a generic configuration
-    q there is an equilibrium stress Omega with rank(Omega) = n - d - 1
-    (and the framework is infinitesimally rigid, rank R = dn - d(d+1)/2).
-    """
+    """Randomised generic GLOBAL rigidity test (Gortler-Healy-Thurston 2010)."""
     e = set(map(tuple, edges.tolist()))
     for i in range(len(anchors)):
         for j in range(i + 1, len(anchors)):
@@ -230,7 +249,6 @@ def globally_rigid(n, edges, anchors, rng, d=2, tol=1e-8):
     rankR = int((s > tol * s[0]).sum())
     if rankR < d * n - d * (d + 1) // 2:
         return False
-    # random equilibrium stress = projection of a random vector onto null(R^T)
     z = rng.standard_normal(len(E))
     w = z - R @ np.linalg.lstsq(R, z, rcond=None)[0]
     Om = np.zeros((n, n))
@@ -261,12 +279,7 @@ def hop_matrix(n, edges, rows):
 
 
 def multilaterate(anchor_xy, g):
-    """
-    Linearised least-squares multilateration (DV-distance style).
-    ||x - a_k||^2 = g_k^2, subtract the k = 1 equation:
-        2 (a_k - a_1)^T x = ||a_k||^2 - ||a_1||^2 - g_k^2 + g_1^2
-    anchor_xy: (K, 2), g: (n, K) estimated distances to anchors -> (n, 2)
-    """
+    """Linearised least-squares multilateration (DV-distance style)."""
     a1 = anchor_xy[0]
     A = 2.0 * (anchor_xy[1:] - a1)                                  # (K-1, 2)
     b = ((anchor_xy[1:] ** 2).sum(1) - (a1 ** 2).sum())[None, :] \
@@ -277,26 +290,28 @@ def multilaterate(anchor_xy, g):
 
 def build_features(n, edges, d_obs, anchors, anchor_xy):
     """
-    Returns a dict of arrays in a NORMALISED frame:
-        origin = anchor centroid, unit = mean pairwise anchor distance (s).
-    Node features (19):
-        is_anchor (1) | own anchor xy (2) | x0 multilateration init (2)
-        geodesic dist to each anchor (K=3) | all anchor xy broadcast (6)
-        hop count to each anchor / 10 (3) | log(1+degree) (1) | mean edge length (1)
+    Returns a dict of arrays in an E(2)-CANONICALIZED frame:
+        origin = anchor centroid (c), unit = mean pairwise anchor distance (s),
+        orientation = canonical O(2) basis R from the 3 best-spread anchors (tri).
+    Node features (19, invariant to K >= 3 anchors):
+        is_anchor (1) | own anchor xy in canonical frame (2) | x0 multilateration init (2)
+        geodesic dists to reference anchor triangle (3) | canonical anchor triangle xy (6)
+        hop counts to reference anchor triangle / 10 (3) | log(1+degree) (1) | mean edge length (1)
     Edge features (3, per DIRECTED edge):
         d_obs | d_obs^2 | |d_obs - ||x0_i - x0_j|||   (last one flags NLOS-like edges)
     """
-    K = len(anchors)
-    c = anchor_xy.mean(0)
-    s = np.mean([np.linalg.norm(anchor_xy[i] - anchor_xy[j])
-                 for i in range(K) for j in range(i + 1, K)])
-    A_n = (anchor_xy - c) / s
+    c, s, R, tri = canonical_anchor_frame(anchor_xy)
+    A_n = ((anchor_xy - c) / s) @ R
     d_n = d_obs / s
 
-    G = geodesic_matrix(n, edges, d_n)[:, anchors]                  # (n, K)
-    H = hop_matrix(n, edges, anchors).T                             # (n, K)
-    x0 = multilaterate(A_n, G)
+    G_all = geodesic_matrix(n, edges, d_n)[:, anchors]              # (n, K)
+    H_all = hop_matrix(n, edges, anchors).T                         # (n, K)
+    x0 = multilaterate(A_n, G_all)
     x0[anchors] = A_n
+
+    G_feat = G_all[:, tri]
+    H_feat = H_all[:, tri]
+    A_tri = A_n[tri]
 
     deg = np.bincount(edges.ravel(), minlength=n).astype(float)
     sum_len = np.bincount(edges[:, 0], weights=d_n, minlength=n) + \
@@ -306,9 +321,9 @@ def build_features(n, edges, d_obs, anchors, anchor_xy):
     own = np.zeros((n, 2))
     own[anchors] = A_n
     X = np.concatenate([
-        is_a[:, None], own, x0, G,
-        np.repeat(A_n.reshape(1, -1), n, 0),
-        H / 10.0, np.log1p(deg)[:, None], (sum_len / np.maximum(deg, 1))[:, None],
+        is_a[:, None], own, x0, G_feat,
+        np.repeat(A_tri.reshape(1, -1), n, 0),
+        H_feat / 10.0, np.log1p(deg)[:, None], (sum_len / np.maximum(deg, 1))[:, None],
     ], axis=1)
 
     src = np.r_[edges[:, 0], edges[:, 1]]
@@ -319,7 +334,8 @@ def build_features(n, edges, d_obs, anchors, anchor_xy):
     return dict(x=X.astype(np.float32), x0=x0.astype(np.float32),
                 edge_index=np.stack([src, dst]).astype(np.int64),
                 edge_attr=EF.astype(np.float32), d_edge=dd.astype(np.float32),
-                center=c.astype(np.float32), scale=np.float32(s))
+                center=c.astype(np.float32), scale=np.float32(s),
+                rot=R.astype(np.float32))
 
 
 # =============================================================================

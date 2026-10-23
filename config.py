@@ -88,8 +88,10 @@ GRAD_CLIP       = 1.0
 # ----------------------------------------------------------------------------
 RUN_SDP            = True    # Biswas-Ye SDP via cvxpy (slowest baseline)
 RUN_PERGRAPH_SAGE  = True    # your previous approach (per-graph training)
+RUN_MPNN_LOC       = True    # MPNN-Loc (Xu & Lin, IFAC 2025)
 PERGRAPH_EPOCHS    = 1000
 YAN_GCN_EPOCHS     = 200
+MPNN_LOC_EPOCHS    = 200
 RUN_GENERALISATION = True
 RUN_BA_EXPERIMENT  = True
 
@@ -114,10 +116,10 @@ for _d in (DATA_DIR, CKPT_DIR, RESULTS_DIR):
 
 # Any of these can be overridden from the environment, e.g.  EPOCHS=10 python step2_train.py
 for _k in ("N_TRAIN", "N_VAL", "TEST_PER_LEVEL", "BA_PER_M", "EPOCHS", "PERGRAPH_EPOCHS", "REFINE_STEPS",
-           "TEST_REFINE_STEPS"):
+           "TEST_REFINE_STEPS", "MPNN_LOC_EPOCHS"):
     if _k in os.environ:
         globals()[_k] = int(os.environ[_k])
-for _k in ("RUN_SDP", "RUN_PERGRAPH_SAGE", "RUN_TRANSFER"):       # e.g.  RUN_SDP=0 python step3_evaluate.py
+for _k in ("RUN_SDP", "RUN_PERGRAPH_SAGE", "RUN_TRANSFER", "RUN_MPNN_LOC"):       # e.g.  RUN_SDP=0 python step3_evaluate.py
     if _k in os.environ:
         globals()[_k] = os.environ[_k] == "1"
 SDP_MAX_N = 100   # SDP gets slow for big graphs (n=200 ~ 1 min/graph): skipped above this
@@ -128,4 +130,4 @@ if os.environ.get("QUICK") == "1":
     MISSING_LEVELS = [0.3, 0.7, 0.9]
     GENERALISE_LEVELS = [0.7]
     BA_PER_M = 2
-    PERGRAPH_EPOCHS, YAN_GCN_EPOCHS = 50, 30
+    PERGRAPH_EPOCHS, YAN_GCN_EPOCHS, MPNN_LOC_EPOCHS = 50, 30, 30

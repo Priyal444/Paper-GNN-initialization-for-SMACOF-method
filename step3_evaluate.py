@@ -36,8 +36,8 @@ from model import AnchorGNNLocalizer, collate, to_original_units
 import baselines as BL
 
 warnings.filterwarnings("ignore")
-# Our model runs on the GPU if there is one, the existing methods always on CPU.
-NUM_GPUS = torch.cuda.device_count() if torch.cuda.is_available() else 0
+FORCE_CPU = os.environ.get("DEVICE", "").lower() == "cpu"
+NUM_GPUS = 0 if FORCE_CPU else (torch.cuda.device_count() if torch.cuda.is_available() else 0)
 if NUM_GPUS >= 2:
     DEVICES = [f"cuda:{i}" for i in range(NUM_GPUS)]
     DEVICE = "cuda:0"
@@ -161,7 +161,6 @@ def evaluate_set(graphs, models, baselines, polish=True, label=""):
     # Pre-build baselines per device for round-robin GPU dispatch
     base_per_dev = {dev: BL.get_baselines(C, device=dev) for dev in DEVICES}
     gpu_methods = {
-        "MDS-MAP", "MDS-MAP + stress (L-BFGS)", "MDS-MAP + Huber stress",
         "DV-distance + dwMDS (no learning)", "Classical MDS (direct)",
         "Rank Alternation (EDM book Alg 2)", "OptSpace (EDM book Alg 3)",
         "Alternating Descent (EDM book Alg 4)", "Yan et al. GCN (3 anchor labels)",
@@ -178,18 +177,15 @@ def evaluate_set(graphs, models, baselines, polish=True, label=""):
         print(f"{label} [Model] '{name}' done -> Mean RMSE: {m_rmse:.4f} ({sec*1000:.1f} ms/graph)", flush=True)
 
         if polish and (name == OURS or name.startswith(TRANSFER)):
-            use_gpu_pol = len(DEVICES) >= 1 and DEVICES[0] != "cpu"
-            worker_count = len(DEVICES) if len(DEVICES) >= 2 else (1 if use_gpu_pol else min(os.cpu_count() or 4, 8))
-            mode_str = f"Dual-GPU parallel ({', '.join(DEVICES)})" if len(DEVICES) >= 2 else (DEVICE if use_gpu_pol else f"Multi-core CPU ({worker_count} workers)")
-            print(f"{label} [Polish] Running Huber L-BFGS polish on {n_graphs} graphs [{mode_str}]...", flush=True)
+            n_cpu_workers = min(os.cpu_count() or 4, 8)
+            print(f"{label} [Polish] Running Huber L-BFGS polish on {n_graphs} graphs (parallel across {n_cpu_workers} CPU workers)...", flush=True)
             t_pol_start = time.time()
             log_step = max(1, n_graphs // 5)
             
             def polish_one(item):
                 idx, g, X = item
-                dev = DEVICES[idx % len(DEVICES)] if use_gpu_pol else "cpu"
                 t0 = time.perf_counter()
-                Y = BL.stress_lbfgs(g, X, robust=True, device=dev)
+                Y = BL.stress_lbfgs(g, X, robust=True)
                 dur = time.perf_counter() - t0
                 return idx, Y, dur
 
@@ -198,7 +194,7 @@ def evaluate_set(graphs, models, baselines, polish=True, label=""):
             completed = 0
             print_lock = threading.Lock()
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as pool:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=n_cpu_workers) as pool:
                 futures = [pool.submit(polish_one, (idx, g, X)) for idx, (g, X) in enumerate(zip(graphs, P))]
                 for f in concurrent.futures.as_completed(futures):
                     idx, Y, dur = f.result()
@@ -215,6 +211,7 @@ def evaluate_set(graphs, models, baselines, polish=True, label=""):
             preds[name + " + Huber polish"] = P2
             pol_rmse = np.nanmean([coord_rmse(g, Y) for g, Y in zip(graphs, P2)])
             print(f"{label} [Polish] Finished in {time.time() - t_pol_start:.1f}s -> Mean RMSE: {pol_rmse:.4f}", flush=True)
+
 
     # 2. Baselines
     n_base = len(baselines)
@@ -287,6 +284,14 @@ def style_for(mth, methods):
     return dict(color=PALETTE[others.index(mth) % len(PALETTE)], lw=1.3, marker=".")
 
 
+def save_fig_both(fname, dpi=150):
+    p_png = os.path.join(C.RESULTS_DIR, fname)
+    p_eps = os.path.join(C.RESULTS_DIR, fname.replace(".png", ".eps"))
+    plt.savefig(p_png, dpi=dpi)
+    plt.savefig(p_eps, format="eps")
+    plt.close()
+
+
 def plot_vs_missing(df, metric, methods, fname, title, ylabel):
     """Line = MEAN over the test graphs at each missing level.
     Shaded band = 25th-75th percentile (a +/- std band is meaningless on a log axis)."""
@@ -311,7 +316,7 @@ def plot_vs_missing(df, metric, methods, fname, title, ylabel):
     h, l = axes[0, 0].get_legend_handles_labels()
     fig.legend(h, l, loc="lower center", ncol=3, fontsize=8, frameon=False)
     fig.suptitle(title + "\n(line = mean over test graphs, band = 25-75th percentile)"); plt.tight_layout(rect=(0, 0.08, 1, 0.95))
-    plt.savefig(os.path.join(C.RESULTS_DIR, fname), dpi=150); plt.close()
+    save_fig_both(fname, dpi=150)
 
 
 def plot_examples(graphs, preds, methods, fname, levels=(30, 70, 90)):
@@ -337,7 +342,8 @@ def plot_examples(graphs, preds, methods, fname, levels=(30, 70, 90)):
                          f"RMSE {coord_rmse(g, X):.2f}", fontsize=8)
             ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
     axes[0, 0].legend(fontsize=7)
-    plt.tight_layout(); plt.savefig(os.path.join(C.RESULTS_DIR, fname), dpi=130); plt.close()
+    plt.tight_layout()
+    save_fig_both(fname, dpi=130)
 
 
 def main_plots(df):
@@ -348,13 +354,17 @@ def main_plots(df):
                     "Average coordinate RMSE on identical test graphs", "coordinate RMSE")
     plot_vs_missing(df, "rmse_certified", main_methods, "fig_certified_rmse.png",
                     "RMSE on nodes whose position is provably unique", "certified-node RMSE")
+    plot_vs_missing(df, "rel_edm", main_methods, "fig_relative_error.png",
+                    "Average Relative EDM Error ||D - D_hat||_F / ||D||_F (Dokmanic et al.)", "relative EDM error")
     if ablations:
         plot_vs_missing(df, "rmse", [OURS] + ablations + ["DV-distance + dwMDS (no learning)"],
                         "fig_ablation.png", "Ablation: what does each part contribute?", "coordinate RMSE")
     rt = df.groupby("method").seconds.mean().sort_values()
     plt.figure(figsize=(8, 0.45 * len(rt) + 1)); plt.barh(rt.index, rt.values, color="slategray")
     plt.xscale("log"); plt.xlabel("seconds per graph (log)"); plt.title("Runtime per graph")
-    plt.tight_layout(); plt.savefig(os.path.join(C.RESULTS_DIR, "fig_runtime.png"), dpi=150); plt.close()
+    plt.tight_layout()
+    save_fig_both("fig_runtime.png", dpi=150)
+
 
 
 # -----------------------------------------------------------------------------
@@ -407,7 +417,7 @@ def plot_transfer(piv, blocks, fname):
                  "random = spanning tree + random edges)\n"
                  "dashed box = graph type never seen in training  ·  bold = best in column  ·  darker = worse",
                  fontsize=9, pad=28)
-    plt.tight_layout(); plt.savefig(os.path.join(C.RESULTS_DIR, fname), dpi=150); plt.close()
+    plt.tight_layout(); save_fig_both(fname, dpi=150)
 
 
 def run_transfer(plot_only=False):
@@ -463,7 +473,7 @@ def main():
 
     main_plots(df)
 
-    show = [m for m in [OURS, "MDS-MAP + Huber stress", "SDP (Biswas-Ye)", "Yan et al. GCN (3 anchor labels)"]
+    show = [m for m in [OURS, "MDS-MAP + Huber stress", "SDP (Biswas-Ye)", "Yan et al. GCN (3 anchor labels)", "MPNN-Loc (Xu & Lin 2025)"]
             if m in preds]
     plot_examples(test, preds, show, "fig_examples.png")
 
@@ -472,7 +482,7 @@ def main():
     print("\nMEAN COORDINATE RMSE (lower is better)\n", piv.round(3).to_string())
 
     # ---------------- generalisation to bigger graphs ----------------
-    fast = {k: v for k, v in baselines.items() if "Per-graph" not in k and "Yan" not in k}
+    fast = {k: v for k, v in baselines.items() if "Per-graph" not in k and "Yan" not in k and "MPNN-Loc" not in k}
     gen_rows = []
     for n in C.GENERALISE_SIZES:
         G = load(f"test_n{n}.pkl")
@@ -491,7 +501,7 @@ def main():
             ax.set_yscale("log"); ax.set_title(f"n = {n} (never seen in training)")
             ax.set_xlabel("missing (%)"); ax.set_ylabel("coordinate RMSE"); ax.grid(alpha=.3)
         axes[0, 0].legend(fontsize=7); plt.tight_layout()
-        plt.savefig(os.path.join(C.RESULTS_DIR, "fig_generalisation.png"), dpi=150); plt.close()
+        save_fig_both("fig_generalisation.png", dpi=150)
 
     # ---------------- Barabasi-Albert rigidity threshold ----------------
     ba = load("test_ba.pkl")
@@ -509,7 +519,7 @@ def main():
         ax[1].bar(r.index - 0.2, r.globally_rigid, 0.4, label="graphs globally rigid")
         ax[1].bar(r.index + 0.2, r.frac_certified, 0.4, label="nodes certified unique")
         ax[1].set_xlabel("m"); ax[1].set_ylim(0, 1.05); ax[1].legend(); ax[1].set_title("Is the answer unique?")
-        plt.tight_layout(); plt.savefig(os.path.join(C.RESULTS_DIR, "fig_ba_rigidity.png"), dpi=150); plt.close()
+        plt.tight_layout(); save_fig_both("fig_ba_rigidity.png", dpi=150)
 
     print(f"\nSTEP 3 done. Figures and CSVs in {C.RESULTS_DIR}")
 

@@ -50,31 +50,32 @@ def mlp(i, h, o, layers=2):
 # batching: many graphs -> one big disconnected graph
 # -----------------------------------------------------------------------------
 def collate(graphs, device="cpu"):
-    xs, x0s, eis, eas, des, ys, am, batch, cen, sca = [], [], [], [], [], [], [], [], [], []
+    xs, x0s, eis, eas, des, ys, am, batch, cen, sca, rots = [], [], [], [], [], [], [], [], [], [], []
     off = 0
     for b, g in enumerate(graphs):
         n = g["n"]
+        R = g.get("rot", np.eye(2, dtype=np.float32))
         xs.append(g["x"]); x0s.append(g["x0"])
         eis.append(g["edge_index"] + off); eas.append(g["edge_attr"]); des.append(g["d_edge"])
         if "y_norm" in g:
             ys.append(g["y_norm"])
         else:
-            ys.append((g["true_xy"] - g["center"]) / g["scale"])       # normalised GT
+            ys.append(((g["true_xy"] - g["center"]) / g["scale"]) @ R)  # E(2)-canonicalised GT
         if "anchor_mask" in g:
             am.append(g["anchor_mask"])
         else:
             a = np.zeros(n, bool); a[g["anchors"]] = True; am.append(a)
-        batch.append(np.full(n, b)); cen.append(g["center"]); sca.append(g["scale"])
+        batch.append(np.full(n, b)); cen.append(g["center"]); sca.append(g["scale"]); rots.append(R)
         off += n
     T = lambda a, dt=torch.float32: torch.as_tensor(np.concatenate(a), dtype=dt, device=device)
     return dict(
         x=T(xs), x0=T(x0s), edge_index=torch.as_tensor(np.concatenate(eis, 1), device=device),
         edge_attr=T(eas), d_edge=T(des), y=T(ys), anchor_mask=T(am, torch.bool),
         batch=T(batch, torch.long), center=torch.as_tensor(np.stack(cen), device=device),
-        scale=torch.as_tensor(np.array(sca), device=device), n_graphs=len(graphs),
-        sizes=[g["n"] for g in graphs],
+        scale=torch.as_tensor(np.array(sca), device=device),
+        rot=torch.as_tensor(np.stack(rots), dtype=torch.float32, device=device),
+        n_graphs=len(graphs), sizes=[g["n"] for g in graphs],
     )
-
 
 
 # -----------------------------------------------------------------------------
@@ -113,9 +114,6 @@ class LearnedSMACOFStep(nn.Module):
         w_ij    = softplus( MLP_w([h_i, h_j, e_ij, d_ij, dhat_ij, |r_ij|]) )
         x_i^+   = sum_j w_ij t_ij / sum_j w_ij             (Guttman transform, local)
         x_i     <- x_i + alpha (x_i^+ - x_i)               (damped Jacobi update)
-    Implementation: the first layer of MLP_w is split into a STATIC part
-    (h_i, h_j, e_ij -- computed once) and a DYNAMIC part (d, dhat, |r| --
-    recomputed every step). Mathematically identical, ~10x cheaper.
     """
     def __init__(self, H, variant="learned", huber_delta=0.05):
         super().__init__()
@@ -186,16 +184,17 @@ class AnchorGNNLocalizer(nn.Module):
 
 
 def to_original_units(B, x_norm):
-    """normalised prediction -> original coordinates, list of (n_i, 2) arrays."""
+    """E(2)-canonicalised prediction -> original coordinates, list of (n_i, 2) arrays."""
     out, off = [], 0
     for b, n in enumerate(B["sizes"]):
-        xb = x_norm[off:off + n] * B["scale"][b] + B["center"][b]
+        R = B["rot"][b]
+        xb = (x_norm[off:off + n] @ R.T) * B["scale"][b] + B["center"][b]
         out.append(xb.detach().cpu().numpy()); off += n
     return out
 
 
 # -----------------------------------------------------------------------------
-# Losses (see the write-up, Section 10, for why these and not others)
+# Losses
 # -----------------------------------------------------------------------------
 def supervised_loss(x, B, delta):
     """Huber on coordinates of NON-anchor nodes (normalised units)."""
@@ -204,8 +203,13 @@ def supervised_loss(x, B, delta):
 
 
 def selfsup_stress_loss(x, B, delta):
-    """No ground truth at all: robust (Huber) stress on observed edges.
-    Anchors are pinned inside the model, so no extra anchor term is needed."""
+    """Asymmetric NLOS-aware Huber stress loss on observed edges:
+    Since NLOS biases are positive (d_edge >= d_true), dhat > d_edge is penalized
+    quadratically, while dhat < d_edge uses robust Huber to discount positive NLOS outliers."""
     src, dst = B["edge_index"]
     dhat = (x[dst] - x[src]).norm(dim=-1).clamp_min(EPS)
-    return F.huber_loss(dhat, B["d_edge"], delta=delta)
+    res = dhat - B["d_edge"]
+    quad_mask = res >= 0.0
+    loss_pos = 0.5 * (res ** 2)
+    loss_neg = F.huber_loss(dhat, B["d_edge"], delta=delta, reduction="none")
+    return torch.where(quad_mask, loss_pos, loss_neg).mean()

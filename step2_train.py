@@ -117,10 +117,10 @@ def main():
         train, val = load("train.pkl"), load("val.pkl")
     print(f"STEP 2: training '{tag}' on {len(train)} graphs ({'Dual-GPU' if multi_gpu else device})", flush=True)
 
-    # Pre-cache normalized coordinates and anchor masks to eliminate CPU bottleneck
+    # Pre-cache E(2)-canonicalised coordinates and anchor masks to eliminate CPU bottleneck
     for g in train + val:
         if "y_norm" not in g:
-            g["y_norm"] = ((g["true_xy"] - g["center"]) / g["scale"]).astype(np.float32)
+            g["y_norm"] = (((g["true_xy"] - g["center"]) / g["scale"]) @ g.get("rot", np.eye(2, dtype=np.float32))).astype(np.float32)
         if "anchor_mask" not in g:
             am = np.zeros(g["n"], bool)
             am[g["anchors"]] = True
@@ -213,8 +213,12 @@ def main():
     ax[1].plot(df.epoch, df.val_rmse_mean, label="mean"); ax[1].plot(df.epoch, df.val_rmse_median, label="median")
     ax[1].set_title("validation coordinate RMSE"); ax[1].legend()
     for a in ax: a.set_xlabel("epoch"); a.grid(alpha=.3)
-    plt.tight_layout(); plt.savefig(os.path.join(C.RESULTS_DIR, f"train_curve_{tag}.png"), dpi=150)
+    plt.tight_layout()
+    plt.savefig(os.path.join(C.RESULTS_DIR, f"train_curve_{tag}.png"), dpi=150)
+    plt.savefig(os.path.join(C.RESULTS_DIR, f"train_curve_{tag}.eps"), format="eps")
+    plt.close()
     print(f"STEP 2 done. best val RMSE {best:.3f} -> {ckpt}", flush=True)
+
 
 
 
