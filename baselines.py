@@ -201,6 +201,18 @@ def dv_dwmds(g, iters=300, alpha=0.5, device="cpu"):
     return X
 
 
+SDP_FALLBACK_COUNT = 0
+
+
+def get_sdp_fallbacks():
+    return SDP_FALLBACK_COUNT
+
+
+def reset_sdp_fallbacks():
+    global SDP_FALLBACK_COUNT
+    SDP_FALLBACK_COUNT = 0
+
+
 def sdp_biswas_ye(g, device="cpu"):
     """
     Z = [[I_2, X], [X^T, Y]] >= 0,  X = unknown positions (2 x m).
@@ -208,7 +220,18 @@ def sdp_biswas_ye(g, device="cpu"):
       anchor-unknown edge : ||a||^2 - 2 a^T x_i + Y_ii = d^2 + s_ij
     minimise sum |s_ij|   (L1 slack = robust to outliers)
     """
-    import cvxpy as cp
+    global SDP_FALLBACK_COUNT
+    if "_sdp" in g and g["_sdp"] is not None:
+        return g["_sdp"].copy()
+    g["_sdp_t0"] = time.perf_counter()
+
+    try:
+        import cvxpy as cp
+    except ImportError:
+        SDP_FALLBACK_COUNT += 1
+        fallback_res = mds_map(g, device=device)
+        g["_sdp"] = fallback_res.copy(); g["_sdp_time"] = time.perf_counter() - g.get("_sdp_t0", time.perf_counter())
+        return fallback_res
     n, E, d = g["n"], g["edges"], g["d_obs"].astype(float)
     anchors = list(g["anchors"])
     is_a = np.zeros(n, bool); is_a[anchors] = True
@@ -237,16 +260,69 @@ def sdp_biswas_ye(g, device="cpu"):
         use_gpu = (device != "cpu" and torch.cuda.is_available())
         try:
             if use_gpu:
-                prob.solve(solver=cp.SCS, max_iters=1000, eps=1e-3, verbose=False, gpu=True)
+                prob.solve(solver=cp.SCS, max_iters=2500, eps=1e-4, verbose=False, gpu=True)
             else:
-                prob.solve(solver=cp.SCS, max_iters=1000, eps=1e-3, verbose=False)
+                prob.solve(solver=cp.SCS, max_iters=2500, eps=1e-4, verbose=False)
         except Exception:
-            prob.solve(solver=cp.SCS, max_iters=1000, eps=1e-3, verbose=False)
+            prob.solve(solver=cp.SCS, max_iters=2500, eps=1e-4, verbose=False)
         Xu = np.asarray(Z.value[:2, 2:]).T
+        if Xu is None or np.isnan(Xu).any():
+            raise ValueError("SDP solution invalid")
     except Exception:
-        return mds_map(g, device=device)
+        SDP_FALLBACK_COUNT += 1
+        fallback_res = mds_map(g, device=device)
+        g["_sdp"] = fallback_res.copy(); g["_sdp_time"] = time.perf_counter() - g.get("_sdp_t0", time.perf_counter())
+        return fallback_res
     X = np.zeros((n, 2)); X[unk] = Xu
-    return _pin(g, X)
+    res = _pin(g, X)
+    g["_sdp"] = res.copy(); g["_sdp_time"] = time.perf_counter() - g.get("_sdp_t0", time.perf_counter())
+    return res
+
+
+def sdp_biswas_ye_huber(g, device="cpu"):
+    """Biswas-Ye SDP followed by Huber L-BFGS polish (equal refinement fairness)."""
+    X_sdp = sdp_biswas_ye(g, device=device)
+    return stress_lbfgs(g, X_sdp, robust=True)
+
+
+def dv_distance_init(g):
+    """Linearised least-squares multilateration from anchor geodesics (DV-distance x0)."""
+    n, E, d = g["n"], g["edges"], g["d_obs"].astype(float)
+    G = geodesic_matrix(n, E, d)[:, g["anchors"]]
+    return _pin(g, multilaterate(g["anchor_xy"].astype(float), G))
+
+
+def dv_distance_huber(g, device="cpu"):
+    """DV-distance multilateration initialization followed by Huber L-BFGS polish.
+    Critical baseline control: isolates the value of learned weights vs initialisation."""
+    X_dv = dv_distance_init(g)
+    return stress_lbfgs(g, X_dv, robust=True)
+
+
+def random_init_huber(g, n_starts=5, seed=0, device="cpu"):
+    """Multi-start random initialization followed by Huber L-BFGS polish.
+    Picks the best start using the identical Huber loss function as stress_lbfgs."""
+    rng = np.random.default_rng(seed)
+    best_X, best_val = None, np.inf
+    n = g["n"]
+    axy = g["anchor_xy"]
+    ac = axy.mean(0)
+    delta = 0.1 * np.median(g["d_obs"])
+    for _ in range(n_starts):
+        X_rand = np.zeros((n, 2))
+        X_rand[:] = ac + rng.standard_normal((n, 2)) * 5.0
+        X_rand[g["anchors"]] = axy
+        X_opt = stress_lbfgs(g, X_rand, robust=True)
+        diff = X_opt[g["edges"][:, 0]] - X_opt[g["edges"][:, 1]]
+        dh = np.sqrt((diff ** 2).sum(1) + 1e-12)
+        r = np.abs(dh - g["d_obs"])
+        val = np.where(r <= delta, 0.5 * r ** 2, delta * (r - 0.5 * delta)).sum()
+        if val < best_val:
+            best_val = val
+            best_X = X_opt
+    return best_X
+
+
 
 
 
@@ -613,10 +689,12 @@ def get_baselines(cfg, device="cpu"):
         "MDS-MAP + stress (L-BFGS)": lambda g: mds_map_stress(g, device=device),
         "MDS-MAP + Huber stress": lambda g: mds_map_huber(g, device=device),
         "DV-distance + dwMDS (no learning)": lambda g: dv_dwmds(g, device=device),
+        "DV-distance + Huber polish": lambda g: dv_distance_huber(g, device=device),
+        "Random (multi-start) + Huber polish": lambda g: random_init_huber(g, device=device),
         "Classical MDS (direct)": lambda g: naive_classical_mds(g, device=device),
         "Rank Alternation (EDM book Alg 2)": lambda g: rank_complete_edm(g, device=device),
-        "OptSpace (EDM book Alg 3)": lambda g: optspace_edm(g, device=device),
-        "Alternating Descent (EDM book Alg 4)": lambda g: alternating_descent(g, device=device),
+        "OptSpace Spectral EDM (Alg 3 init)": lambda g: optspace_edm(g, device=device),
+        "s-stress L-BFGS (Alg 4 s-stress)": lambda g: alternating_descent(g, device=device),
         "Yan et al. GCN (3 anchor labels)": lambda g: yan_gcn(g, epochs=cfg.YAN_GCN_EPOCHS, device=device),
     }
     if getattr(cfg, "RUN_MPNN_LOC", True):
@@ -625,6 +703,7 @@ def get_baselines(cfg, device="cpu"):
         )
     if cfg.RUN_SDP:
         B["SDP (Biswas-Ye)"] = lambda g: sdp_biswas_ye(g, device=device)
+        B["SDP + Huber polish"] = lambda g: sdp_biswas_ye_huber(g, device=device)
     if cfg.RUN_PERGRAPH_SAGE:
         B["Per-graph GraphSAGE (previous)"] = lambda g: pergraph_sage(g, epochs=cfg.PERGRAPH_EPOCHS, device=device)
     return B

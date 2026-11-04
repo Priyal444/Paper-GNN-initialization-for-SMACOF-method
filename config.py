@@ -43,9 +43,8 @@ N_TRAIN          = 3000      # training graphs (random missing %, noise, type)
 N_VAL            = 400
 TRAIN_N_RANGE    = (30, 80)  # train on VARIABLE sizes -> generalises in n
 TRAIN_MISSING    = (0.10, 0.90)
-TEST_PER_LEVEL   = 20        # test graphs per (scenario, missing level)
-TEST_SCENARIOS   = [("random", "clean"), ("random", "nlos"),
-                    ("rgg", "clean"),    ("rgg", "nlos"),
+TEST_SCENARIOS   = [("random", "clean"), ("random", "gauss"), ("random", "nlos"),
+                    ("rgg", "clean"),    ("rgg", "gauss"),    ("rgg", "nlos"),
                     ("ba", "clean"),     ("ba", "nlos")]
 GENERALISE_SIZES = [100, 200]          # extra test sets, never seen in training
 GENERALISE_SCENARIO = ("rgg", "nlos")
@@ -73,7 +72,7 @@ ENC_LAYERS      = 5          # message-passing layers in the encoder
 REFINE_STEPS    = 10         # unrolled learned-SMACOF steps during TRAINING
 TEST_REFINE_STEPS = 50       # steps at TEST time (same shared step, run longer:
                              # exact fits are fixed points, so more steps only converge further)
-VARIANT         = "learned"  # "learned" | "uniform" | "huber" | "encoder_only"
+VARIANT         = "learned"  # "learned" | "uniform" | "huber" | "huber_alpha" | "encoder_only"
 LOSS_MODE       = "supervised"   # "supervised" (synthetic GT) | "selfsup" (no GT)
 HUBER_DELTA     = 0.05       # in normalised units (anchor-triangle scale = 1)
 AUX_WEIGHT      = 0.3        # weight of the encoder-output loss (deep supervision)
@@ -89,6 +88,10 @@ GRAD_CLIP       = 1.0
 RUN_SDP            = True    # Biswas-Ye SDP via cvxpy (slowest baseline)
 RUN_PERGRAPH_SAGE  = True    # your previous approach (per-graph training)
 RUN_MPNN_LOC       = True    # MPNN-Loc (Xu & Lin, IFAC 2025)
+RUN_CPU_TIMING     = False   # Set to True for single-threaded CPU runtime benchmark
+RUN_EXTENDED_EXPERIMENTS = True
+ANCHOR_COUNTS      = [3, 4, 5, 6, 7, 8]  # K = 3..8 anchor sensitivity sweep
+EXTENDED_TEST_PER_LEVEL = 50             # graphs per level for extended sweeps
 PERGRAPH_EPOCHS    = 1000
 YAN_GCN_EPOCHS     = 200
 MPNN_LOC_EPOCHS    = 200
@@ -109,10 +112,12 @@ def train_types(key):
 # ----------------------------------------------------------------------------
 ROOT        = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR    = os.path.join(ROOT, "data")
-CKPT_DIR    = os.path.join(ROOT, "checkpoints")
-RESULTS_DIR = os.path.join(ROOT, "results")
+RUN_TAG     = os.environ.get("RUN_TAG", "")
+CKPT_DIR    = os.path.join(ROOT, "checkpoints", RUN_TAG)
+RESULTS_DIR = os.path.join(ROOT, "results", RUN_TAG)
 for _d in (DATA_DIR, CKPT_DIR, RESULTS_DIR):
     os.makedirs(_d, exist_ok=True)
+
 
 # Any of these can be overridden from the environment, e.g.  EPOCHS=10 python step2_train.py
 for _k in ("N_TRAIN", "N_VAL", "TEST_PER_LEVEL", "BA_PER_M", "EPOCHS", "PERGRAPH_EPOCHS", "REFINE_STEPS",
@@ -130,4 +135,5 @@ if os.environ.get("QUICK") == "1":
     MISSING_LEVELS = [0.3, 0.7, 0.9]
     GENERALISE_LEVELS = [0.7]
     BA_PER_M = 2
+    EXTENDED_TEST_PER_LEVEL = 2
     PERGRAPH_EPOCHS, YAN_GCN_EPOCHS, MPNN_LOC_EPOCHS = 50, 30, 30

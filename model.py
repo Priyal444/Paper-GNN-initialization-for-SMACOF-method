@@ -50,13 +50,16 @@ def mlp(i, h, o, layers=2):
 # batching: many graphs -> one big disconnected graph
 # -----------------------------------------------------------------------------
 def collate(graphs, device="cpu"):
-    xs, x0s, eis, eas, des, ys, am, batch, cen, sca, rots = [], [], [], [], [], [], [], [], [], [], []
+    xs, x0s, eis, eas, des, ys, am, certs, batch, cen, sca, rots = [], [], [], [], [], [], [], [], [], [], [], []
+    is_nlos_list = []
     off = 0
     for b, g in enumerate(graphs):
         n = g["n"]
         R = g.get("rot", np.eye(2, dtype=np.float32))
         xs.append(g["x"]); x0s.append(g["x0"])
         eis.append(g["edge_index"] + off); eas.append(g["edge_attr"]); des.append(g["d_edge"])
+        if "is_nlos" in g:
+            is_nlos_list.append(np.r_[g["is_nlos"], g["is_nlos"]])
         if "y_norm" in g:
             ys.append(g["y_norm"])
         else:
@@ -65,17 +68,26 @@ def collate(graphs, device="cpu"):
             am.append(g["anchor_mask"])
         else:
             a = np.zeros(n, bool); a[g["anchors"]] = True; am.append(a)
+        if "certified" in g:
+            certs.append(g["certified"])
+        else:
+            certs.append(np.ones(n, bool))
         batch.append(np.full(n, b)); cen.append(g["center"]); sca.append(g["scale"]); rots.append(R)
         off += n
     T = lambda a, dt=torch.float32: torch.as_tensor(np.concatenate(a), dtype=dt, device=device)
-    return dict(
+    res = dict(
         x=T(xs), x0=T(x0s), edge_index=torch.as_tensor(np.concatenate(eis, 1), device=device),
         edge_attr=T(eas), d_edge=T(des), y=T(ys), anchor_mask=T(am, torch.bool),
+        certified=T(certs, torch.bool),
         batch=T(batch, torch.long), center=torch.as_tensor(np.stack(cen), device=device),
         scale=torch.as_tensor(np.array(sca), device=device),
-        rot=torch.as_tensor(np.stack(rots), dtype=torch.float32, device=device),
-        n_graphs=len(graphs), sizes=[g["n"] for g in graphs],
+        rot=torch.as_tensor(np.stack(rots), device=device),
+        sizes=[g["n"] for g in graphs],
     )
+    if is_nlos_list and len(is_nlos_list) == len(graphs):
+        res["is_nlos"] = T(is_nlos_list, torch.bool)
+    return res
+
 
 
 # -----------------------------------------------------------------------------
@@ -111,7 +123,7 @@ class LearnedSMACOFStep(nn.Module):
     For every node i (anchors are re-pinned afterwards):
         dhat_ij = ||x_i - x_j||,   r_ij = d_ij - dhat_ij
         t_ij    = x_j + d_ij * (x_i - x_j) / dhat_ij       (where edge ij wants x_i)
-        w_ij    = softplus( MLP_w([h_i, h_j, e_ij, d_ij, dhat_ij, |r_ij|]) )
+        w_ij    = bounded_modulation( Huber(r_ij), MLP_w(...) ) in [1e-3, 1.0]
         x_i^+   = sum_j w_ij t_ij / sum_j w_ij             (Guttman transform, local)
         x_i     <- x_i + alpha (x_i^+ - x_i)               (damped Jacobi update)
     """
@@ -121,6 +133,8 @@ class LearnedSMACOFStep(nn.Module):
         self.w_static = nn.Linear(3 * H, H)
         self.w_dyn = nn.Linear(3, H, bias=False)
         self.w_out = nn.Linear(H, 1)
+        nn.init.zeros_(self.w_out.weight)
+        nn.init.zeros_(self.w_out.bias)
         self.alpha_logit = nn.Parameter(torch.tensor(0.0))   # alpha = 0.5 at init
 
     def prepare(self, h, e, ei):
@@ -132,22 +146,27 @@ class LearnedSMACOFStep(nn.Module):
     def weights(self, static, d, dhat, r):
         if self.variant == "uniform":
             return torch.ones_like(d)
-        if self.variant == "huber":
+        if self.variant in ("huber", "huber_alpha"):
             return torch.clamp(self.delta / r.abs().clamp_min(EPS), max=1.0)
         z = F.silu(static + self.w_dyn(torch.stack([d, dhat, r.abs()], -1)))
-        return F.softplus(self.w_out(z)).squeeze(-1) + 1e-4
+        # Bounded neural modulation over classical Huber weights (strictly in [1e-3, 1.0])
+        w_base = torch.clamp(self.delta / r.abs().clamp_min(EPS), max=1.0)
+        w_gate = torch.sigmoid(self.w_out(z)).squeeze(-1) * 2.0  # init centered at 1.0
+        return (w_base * w_gate).clamp(min=1e-3, max=1.0)
 
     def forward(self, x, static, ei, d, anchor_mask, x_anchor):
         src, dst = ei
         diff = x[dst] - x[src]
-        dhat = diff.norm(dim=-1).clamp_min(EPS)
+        dhat = diff.norm(dim=-1).clamp_min(1e-4)
         r = d - dhat
         w = self.weights(static, d, dhat, r)
         target = x[src] + d[:, None] * diff / dhat[:, None]
         num = scatter_sum(w[:, None] * target, dst, x.size(0))
         den = scatter_sum(w[:, None], dst, x.size(0)).clamp_min(EPS)
-        alpha = torch.sigmoid(self.alpha_logit) if self.variant == "learned" else 0.5
-        x_new = x + alpha * (num / den - x)
+        learn_alpha = (self.variant in ("learned", "huber_alpha"))
+        alpha = torch.sigmoid(self.alpha_logit).clamp(min=0.1, max=0.7) if learn_alpha else 0.5
+        step_update = (num / den - x).clamp(min=-5.0, max=5.0)
+        x_new = x + alpha * step_update
         return torch.where(anchor_mask[:, None], x_anchor, x_new), w
 
 
@@ -159,6 +178,7 @@ class AnchorGNNLocalizer(nn.Module):
                  variant="learned", huber_delta=0.05):
         super().__init__()
         self.variant = variant
+        self.delta = huber_delta
         self.T = 0 if variant == "encoder_only" else refine_steps
         self.node_in = mlp(in_dim, H, H)
         self.edge_in = mlp(edge_dim, H, H)
@@ -167,7 +187,7 @@ class AnchorGNNLocalizer(nn.Module):
         # ONE shared step -> it is an iterative algorithm, so T can change at test time
         self.step = LearnedSMACOFStep(H, variant, huber_delta)
 
-    def forward(self, B, T=None, return_all=False):
+    def forward(self, B, T=None, return_all=False, return_weights=False):
         x0, am, ei, d = B["x0"], B["anchor_mask"], B["edge_index"], B["d_edge"]
         x_anchor = x0                                   # anchors' x0 == true anchor xy
         h = self.node_in(B["x"])
@@ -177,10 +197,15 @@ class AnchorGNNLocalizer(nn.Module):
         xA = torch.where(am[:, None], x_anchor, x0 + self.head(h))   # stage-A estimate
         x, traj = xA, [xA]
         static = self.step.prepare(h, e, ei)
+        w_last = None
         for _ in range(self.T if T is None else T):
-            x, _ = self.step(x, static, ei, d, am, x_anchor)
+            x, w_last = self.step(x, static, ei, d, am, x_anchor)
             traj.append(x)
+        if return_weights:
+            x_prev = traj[-2] if len(traj) >= 2 else xA
+            return x, xA, w_last, x_prev
         return (x, xA, traj) if return_all else (x, xA)
+
 
 
 def to_original_units(B, x_norm):
@@ -197,8 +222,13 @@ def to_original_units(B, x_norm):
 # Losses
 # -----------------------------------------------------------------------------
 def supervised_loss(x, B, delta):
-    """Huber on coordinates of NON-anchor nodes (normalised units)."""
+    """Huber on coordinates of NON-anchor, RIGIDLY CERTIFIED nodes (normalised units).
+    Excludes non-identifiable nodes (e.g. flip/flex ambiguities) to eliminate training noise."""
     m = ~B["anchor_mask"]
+    if "certified" in B:
+        m_cert = m & B["certified"]
+        if m_cert.any():
+            m = m_cert
     return F.huber_loss(x[m], B["y"][m], delta=delta)
 
 

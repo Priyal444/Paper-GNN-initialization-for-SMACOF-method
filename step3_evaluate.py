@@ -31,7 +31,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import config as C
-from common import coord_rmse, rel_edm_error
+from common import coord_rmse, rel_edm_error, cramer_rao_lower_bound, dump_run_config
 from model import AnchorGNNLocalizer, collate, to_original_units
 import baselines as BL
 
@@ -53,6 +53,7 @@ VARIANT_NAMES = {
     "learned": OURS,
     "uniform": "Ablation: encoder + uniform-weight steps",
     "huber": "Ablation: encoder + Huber-weight steps",
+    "huber_alpha": "Ablation: Huber weights + learned alpha",
     "encoder_only": "Ablation: encoder only (no refiner)",
     "learned_selfsup": "Ours, self-supervised (no ground truth)",
 }
@@ -80,12 +81,14 @@ def load_models(transfer=False):
         ck = torch.load(path, map_location=DEVICE, weights_only=False)
         if transfer and ck["variant"] != "learned":
             continue
+        huber_delta = ck.get("huber_delta", C.HUBER_DELTA)
         m = AnchorGNNLocalizer(ck["in_dim"], ck["edge_dim"], ck["H"], ck["enc_layers"],
-                               ck["refine_steps"], ck["variant"], C.HUBER_DELTA).to(DEVICE)
+                               ck["refine_steps"], ck["variant"], huber_delta=huber_delta).to(DEVICE)
         m.load_state_dict(ck["state"]); m.eval()
         name = TRANSFER + ck["train_on"] if transfer else VARIANT_NAMES.get(tag, tag)
         models[name] = m
     return models
+
 
 
 def run_gnn(model, graphs, bs=64):
@@ -132,11 +135,32 @@ def run_gnn(model, graphs, bs=64):
 
 
 def score_rows(g, method, X, secs):
-    return dict(scenario=g["scenario"], missing=int(round(100 * g["missing_nominal"])), n=g["n"],
-                graph_id=g["graph_id"], method=method, rmse=coord_rmse(g, X),
-                rmse_certified=coord_rmse(g, X, g["certified"]), rel_edm=rel_edm_error(g, X),
-                seconds=secs, globally_rigid=bool(g["globally_rigid"]),
-                frac_certified=float(g["certified"].mean()), ba_m=g.get("ba_m"))
+    r = coord_rmse(g, X)
+    n_nodes = g.get("n", len(g.get("true_xy", [])))
+    cert = g.get("certified")
+    if cert is None:
+        cert = np.ones(n_nodes, dtype=bool)
+    rc = coord_rmse(g, X, cert)
+    re = rel_edm_error(g, X)
+    r_eval = rc if not np.isnan(rc) else r
+    scen = g.get("scenario", f"{g.get('graph_type', 'rgg')}/{g.get('noise', 'clean')}")
+    crlb = cramer_rao_lower_bound(g, sigma=0.05) if "gauss" in scen else np.nan
+    rmse_crlb_subset = r if not np.isnan(crlb) else np.nan
+    miss_nom = g.get("missing_nominal", g.get("missing_ratio", 0.5))
+    frac_cert = float(cert.mean()) if hasattr(cert, "mean") else 1.0
+    return dict(scenario=scen, missing=int(round(100 * miss_nom)), n=n_nodes,
+                graph_id=g.get("graph_id", 0), method=method, rmse=r,
+                rmse_certified=rc, rmse_crlb_subset=rmse_crlb_subset, rel_edm=re, crlb=crlb,
+                catastrophic_fail=bool(r > 1.5),
+                fail_05=bool(r_eval > 0.5),
+                fail_10=bool(r_eval > 1.0),
+                fail_15=bool(r_eval > 1.5),
+                fail_20=bool(r_eval > 2.0),
+                seconds=secs, globally_rigid=bool(g.get("globally_rigid", True)),
+                frac_certified=frac_cert, ba_m=g.get("ba_m"),
+                anchor_k=g.get("anchor_k", len(g.get("anchors", []))),
+                p_nlos=g.get("p_nlos", 0.0))
+
 
 
 def warmup_cuda(devices):
@@ -162,10 +186,11 @@ def evaluate_set(graphs, models, baselines, polish=True, label=""):
     base_per_dev = {dev: BL.get_baselines(C, device=dev) for dev in DEVICES}
     gpu_methods = {
         "DV-distance + dwMDS (no learning)", "Classical MDS (direct)",
-        "Rank Alternation (EDM book Alg 2)", "OptSpace (EDM book Alg 3)",
-        "Alternating Descent (EDM book Alg 4)", "Yan et al. GCN (3 anchor labels)",
-        "Per-graph GraphSAGE (previous)"
+        "Rank Alternation (EDM book Alg 2)", "OptSpace Spectral EDM (Alg 3 init)",
+        "s-stress L-BFGS (Alg 4 s-stress)", "Yan et al. GCN (3 anchor labels)",
+        "MPNN-Loc (Xu & Lin 2025)", "Per-graph GraphSAGE (previous)"
     }
+
 
     # 1. Models
     for name, m in models.items():
@@ -213,9 +238,37 @@ def evaluate_set(graphs, models, baselines, polish=True, label=""):
             print(f"{label} [Polish] Finished in {time.time() - t_pol_start:.1f}s -> Mean RMSE: {pol_rmse:.4f}", flush=True)
 
 
-    # 2. Baselines
-    n_base = len(baselines)
-    for b_idx, (name, fn) in enumerate(baselines.items(), 1):
+    # 2. Baselines (cached across seeds on identical test graphs)
+    cache_lbl = label.replace("[", "").replace("]", "").strip()
+    cache_file = os.path.join(C.DATA_DIR, f"baseline_cache_{cache_lbl}.pkl" if cache_lbl else "baseline_cache.pkl")
+    cached_data = {}
+    cached_fallbacks = 0
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "rb") as f:
+                loaded = pickle.load(f)
+                if isinstance(loaded, dict) and "data" in loaded:
+                    cached_data = loaded["data"]
+                    cached_fallbacks = loaded.get("sdp_fallbacks", 0)
+                elif isinstance(loaded, dict):
+                    cached_data = loaded
+        except Exception:
+            cached_data = {}
+
+    to_run = {}
+    for name, fn in baselines.items():
+        if name in cached_data and len(cached_data[name]["rows"]) == n_graphs:
+            print(f"{label} [Baseline Cache] Reusing cached predictions for '{name}' ({n_graphs} graphs)", flush=True)
+            preds[name] = cached_data[name]["preds"]
+            rows.extend(cached_data[name]["rows"])
+            if "SDP" in name and cached_fallbacks > 0:
+                BL.SDP_FALLBACK_COUNT = cached_fallbacks
+        else:
+            to_run[name] = fn
+
+    n_base = len(to_run)
+    cache_dirty = False
+    for b_idx, (name, fn) in enumerate(to_run.items(), 1):
         is_gpu = (name in gpu_methods) and (DEVICES[0] != "cpu")
         if is_gpu and len(DEVICES) >= 2:
             worker_count = len(DEVICES)
@@ -239,7 +292,10 @@ def evaluate_set(graphs, models, baselines, polish=True, label=""):
             k, g = item
             dev = DEVICES[k % len(DEVICES)] if is_gpu else DEVICE
             target_fn = base_per_dev[dev].get(name, fn)
+            had_sdp = g.get("_sdp") is not None
             X, sec = BL.timed(target_fn, g)
+            if name == "SDP + Huber polish" and had_sdp:
+                sec += g.get("_sdp_time", 0.0)   # count reused SDP solve duration
             return k, X, sec
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as pool:
@@ -257,8 +313,22 @@ def evaluate_set(graphs, models, baselines, polish=True, label=""):
 
         preds[name] = P
         rows.extend(base_rows)
+        cached_data[name] = dict(preds=P, rows=base_rows)
+        cache_dirty = True
+        try:
+            with open(cache_file, "wb") as f:
+                pickle.dump({"data": cached_data, "sdp_fallbacks": BL.get_sdp_fallbacks()}, f)
+        except Exception:
+            pass
         b_rmse = np.nanmean([coord_rmse(g, X) for g, X in zip(graphs, P)])
         print(f"{label} [{b_idx}/{n_base}] '{name}' completed in {time.time() - t0:.1f}s -> Mean RMSE: {b_rmse:.4f}", flush=True)
+
+    if cache_dirty:
+        try:
+            with open(cache_file, "wb") as f:
+                pickle.dump({"data": cached_data, "sdp_fallbacks": BL.get_sdp_fallbacks()}, f)
+        except Exception:
+            pass
 
     return pd.DataFrame(rows), preds
 
@@ -269,7 +339,11 @@ def evaluate_set(graphs, models, baselines, polish=True, label=""):
 # plotting
 # -----------------------------------------------------------------------------
 STYLE = {OURS: dict(color="crimson", lw=2.6, marker="o"),
-         OURS + " + Huber polish": dict(color="darkred", lw=2.0, marker="s", ls="--")}
+         OURS + " + Huber polish": dict(color="darkred", lw=2.2, marker="s", ls="--"),
+         "SDP + Huber polish": dict(color="purple", lw=1.8, marker="^", ls=":"),
+         "MDS-MAP + Huber stress": dict(color="teal", lw=1.8, marker="d", ls="-."),
+         "DV-distance + Huber polish": dict(color="darkorange", lw=1.8, marker="v", ls="-.")}
+
 
 
 PALETTE = ["#1f77b4", "#2ca02c", "#ff7f0e", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
@@ -301,14 +375,22 @@ def plot_vs_missing(df, metric, methods, fname, title, ylabel):
     for ax, sc in zip(axes.ravel(), scen):
         d = df[df.scenario == sc]
         for mth in methods:
-            g = d[d.method == mth].groupby("missing")[metric]
+            use_col = metric
+            g = d[d.method == mth].groupby("missing")[use_col]
             if g.ngroups == 0: continue
             mean, q1, q3 = g.mean(), g.quantile(0.25), g.quantile(0.75)
             st = style_for(mth, methods)
             ax.plot(mean.index, np.maximum(mean, FLOOR), label=mth, **st)
             ax.fill_between(mean.index, np.maximum(q1, FLOOR), np.maximum(q3, FLOOR),
                             color=st.get("color"), alpha=0.10, lw=0)
+        if metric in ("rmse", "rmse_certified") and "crlb" in d.columns and "gauss" in sc:
+            crlb_s = d.drop_duplicates(["scenario", "missing", "graph_id"]).groupby("missing")["crlb"].mean()
+            if not crlb_s.isna().all():
+                ax.plot(crlb_s.index, np.maximum(crlb_s.values, FLOOR), label="CRLB (bound)",
+                        color="black", ls=":", lw=1.8, marker="")
         ax.set_yscale("log"); ax.set_ylim(bottom=FLOOR * 0.7); ax.set_title(sc)
+
+
         ax.set_xlim(df.missing.min() - 3, df.missing.max() + 3)   # same x range in every panel (BA starts at 50 %)
         ax.set_xlabel("missing distances (%)")
         ax.set_ylabel(f"{ylabel}  (floor = exact)"); ax.grid(alpha=.3, which="both")
@@ -323,7 +405,7 @@ def plot_examples(graphs, preds, methods, fname, levels=(30, 70, 90)):
     pick = []
     for lv in levels:
         for i, g in enumerate(graphs):
-            if int(round(100 * g["missing_nominal"])) == lv:
+            if int(round(100 * g.get("missing_nominal", g.get("missing_ratio", 0.5)))) == lv:
                 pick.append(i); break
     if not pick: return
     fig, axes = plt.subplots(len(methods), len(pick), figsize=(4.2 * len(pick), 4 * len(methods)), squeeze=False)
@@ -444,13 +526,371 @@ def run_transfer(plot_only=False):
     print(f"\nTRANSFER MATRIX: mean RMSE, missing >= {int(100 * C.TRANSFER_MIN_MISSING)} %\n", piv.round(3).to_string())
 
 
+def plot_extended_sweeps(df_anc, df_nlos):
+    # 1. Anchor Sensitivity Plot (K = 3..8)
+    if df_anc is not None and not df_anc.empty:
+        fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+        methods = [m for m in df_anc["method"].unique() if not m.startswith("Ablation") or m == OURS]
+        ax0, ax1 = axes[0], axes[1]
+        for mth in methods:
+            sub = df_anc[df_anc["method"] == mth]
+            agg = sub.groupby("anchor_k")[["rmse", "rel_edm"]].mean()
+            st = style_for(mth, methods)
+            ax0.plot(agg.index, agg["rmse"], label=mth, **st)
+            ax1.plot(agg.index, agg["rel_edm"], label=mth, **st)
+        ax0.set_xlabel("Number of Anchors (K)", fontsize=10)
+        ax0.set_ylabel("Coordinate RMSE (m)", fontsize=10)
+        ax0.set_title("Anchor Sensitivity: Coordinate RMSE vs K", fontsize=11)
+        ax0.grid(True, alpha=0.3); ax0.set_yscale("log")
+        ax1.set_xlabel("Number of Anchors (K)", fontsize=10)
+        ax1.set_ylabel("Relative EDM Error ||D - D^||_F / ||D||_F", fontsize=10)
+        ax1.set_title("Anchor Sensitivity: Relative Error vs K", fontsize=11)
+        ax1.grid(True, alpha=0.3); ax1.set_yscale("log")
+        handles, labels = ax0.get_legend_handles_labels()
+        fig.legend(handles, labels, loc="lower center", ncol=min(4, max(1, len(methods))), fontsize=8, frameon=False)
+        plt.tight_layout(rect=(0, 0.08, 1, 0.95))
+        save_fig_both("fig_anchor_sensitivity.png", dpi=150)
+
+    # 2. NLOS Contamination Sweep Plot (p_nlos = 0..0.5)
+    if df_nlos is not None and not df_nlos.empty:
+        fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+        methods = [m for m in df_nlos["method"].unique() if not m.startswith("Ablation") or m == OURS]
+        ax0, ax1 = axes[0], axes[1]
+        for mth in methods:
+            sub = df_nlos[df_nlos["method"] == mth]
+            agg = sub.groupby("p_nlos")[["rmse", "rel_edm"]].mean()
+            st = style_for(mth, methods)
+            ax0.plot(agg.index, agg["rmse"], label=mth, **st)
+            ax1.plot(agg.index, agg["rel_edm"], label=mth, **st)
+        ax0.set_xlabel("NLOS Probability p_nlos", fontsize=10)
+        ax0.set_ylabel("Coordinate RMSE (m)", fontsize=10)
+        ax0.set_title("NLOS Robustness: Coordinate RMSE vs p_nlos", fontsize=11)
+        ax0.grid(True, alpha=0.3)
+        ax1.set_xlabel("NLOS Probability p_nlos", fontsize=10)
+        ax1.set_ylabel("Relative EDM Error ||D - D^||_F / ||D||_F", fontsize=10)
+        ax1.set_title("NLOS Robustness: Relative Error vs p_nlos", fontsize=11)
+        ax1.grid(True, alpha=0.3)
+        handles, labels = ax0.get_legend_handles_labels()
+        fig.legend(handles, labels, loc="lower center", ncol=min(4, max(1, len(methods))), fontsize=8, frameon=False)
+        plt.tight_layout(rect=(0, 0.08, 1, 0.95))
+        save_fig_both("fig_nlos_sweep.png", dpi=150)
+
+
+def run_extended_sweeps(plot_only=False):
+    anc_csv = os.path.join(C.RESULTS_DIR, "anchor_sweep_results.csv")
+    nlos_csv = os.path.join(C.RESULTS_DIR, "nlos_sweep_results.csv")
+    df_anc, df_nlos = None, None
+    if plot_only:
+        if os.path.exists(anc_csv): df_anc = pd.read_csv(anc_csv)
+        if os.path.exists(nlos_csv): df_nlos = pd.read_csv(nlos_csv)
+    else:
+        models = load_models(transfer=False)
+        models = {k: v for k, v in models.items() if k in (OURS, "Ablation: encoder only (no refiner)")}
+        base_all = BL.get_baselines(C, device=DEVICE)
+        eval_base = {k: v for k, v in base_all.items() if k in (
+            "MDS-MAP", "MDS-MAP + Huber stress", "DV-distance + Huber polish", "SDP (Biswas-Ye)", "SDP + Huber polish",
+            "s-stress L-BFGS (Alg 4 s-stress)", "Rank Alternation (EDM book Alg 2)",
+            "MPNN-Loc (Xu & Lin 2025)"
+        )}
+        # 1. Anchor sweep
+        anc_graphs = load("anchor_sweep_test.pkl")
+        if anc_graphs:
+            print(f"\n[Extended] Evaluating Anchor Sensitivity on {len(anc_graphs)} graphs...", flush=True)
+            df_anc, _ = evaluate_set(anc_graphs, models, eval_base, polish=True, label="[anchors]")
+            df_anc.to_csv(anc_csv, index=False)
+            print("Anchor sweep saved ->", anc_csv)
+        else:
+            print("\n[Extended] Warning: anchor_sweep_test.pkl not found! Run step1_data.py first.")
+
+        # 2. NLOS sweep
+        nlos_graphs = load("nlos_sweep_test.pkl")
+        if nlos_graphs:
+            print(f"\n[Extended] Evaluating NLOS Contamination on {len(nlos_graphs)} graphs...", flush=True)
+            df_nlos, _ = evaluate_set(nlos_graphs, models, eval_base, polish=True, label="[nlos]")
+            df_nlos.to_csv(nlos_csv, index=False)
+            print("NLOS sweep saved ->", nlos_csv)
+        else:
+            print("\n[Extended] Warning: nlos_sweep_test.pkl not found! Run step1_data.py first.")
+
+    plot_extended_sweeps(df_anc, df_nlos)
+def compute_rank_auc(y_true, scores):
+    """Computes ROC AUC via Wilcoxon-Mann-Whitney rank sum with average ranks for ties."""
+    from scipy.stats import rankdata
+    y_true = np.asarray(y_true, dtype=bool)
+    scores = np.asarray(scores, dtype=float)
+    n_pos = int(y_true.sum())
+    n_neg = len(y_true) - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return np.nan
+    ranks = rankdata(scores)
+    rank_sum_pos = ranks[y_true].sum()
+    u = rank_sum_pos - n_pos * (n_pos + 1) / 2.0
+    return float(u / (n_pos * n_neg))
+
+
+def analyze_nlos_weights(models, graphs):
+    """
+    Evaluates whether the GNN's learned edge weights specifically detect and
+    downweight positive NLOS outliers compared to classical Huber IRLS weights.
+    Generates results/nlos_weight_analysis.csv and results/fig_nlos_edge_weights.png.
+    """
+    if OURS not in models:
+        return
+    model = models[OURS]
+    model.eval()
+
+    nlos_graphs = [g for g in graphs if g.get("is_nlos") is not None and g["is_nlos"].any()]
+    if not nlos_graphs:
+        return
+    print(f"\n[Analysis] Evaluating NLOS outlier edge detection across {len(nlos_graphs)} NLOS graphs...", flush=True)
+
+    rows = []
+    all_w_clean_learned, all_w_nlos_learned = [], []
+    all_w_clean_huber, all_w_nlos_huber = [], []
+
+    for g in nlos_graphs:
+        B = collate([g], DEVICE)
+        with torch.no_grad():
+            x, xA, w_learned, x_prev = model(B, T=C.TEST_REFINE_STEPS, return_weights=True)
+            w_learned = w_learned.detach().cpu().numpy()
+
+            # Classical Huber weights evaluated at identical x_prev positions (fair comparison)
+            ei = B["edge_index"].cpu().numpy()
+            d = B["d_edge"].cpu().numpy()
+            src, dst = ei[0], ei[1]
+            diff = (x_prev[dst] - x_prev[src]).cpu().numpy()
+            dhat = np.maximum(np.linalg.norm(diff, axis=-1), 1e-4)
+            r = np.abs(d - dhat)
+            w_huber = np.clip(C.HUBER_DELTA / np.maximum(r, 1e-9), 1e-3, 1.0)
+
+        # Labels: clean = 1 (higher weight expected), nlos = 0
+        is_nlos = np.r_[g["is_nlos"], g["is_nlos"]]
+        is_clean = ~is_nlos
+
+        auc_learned = compute_rank_auc(is_clean, w_learned)
+        auc_huber = compute_rank_auc(is_clean, w_huber)
+
+        all_w_clean_learned.extend(w_learned[is_clean])
+        all_w_nlos_learned.extend(w_learned[is_nlos])
+        all_w_clean_huber.extend(w_huber[is_clean])
+        all_w_nlos_huber.extend(w_huber[is_nlos])
+
+        rows.append(dict(
+            scenario=g["scenario"], missing=int(round(100 * g["missing_nominal"])),
+            graph_id=g["graph_id"], auc_learned=auc_learned, auc_huber=auc_huber,
+            frac_nlos=float(is_nlos.mean())
+        ))
+
+    df_auc = pd.DataFrame(rows)
+    df_auc.to_csv(os.path.join(C.RESULTS_DIR, "nlos_weight_analysis.csv"), index=False)
+
+    mean_auc_learned = float(df_auc["auc_learned"].mean())
+    mean_auc_huber = float(df_auc["auc_huber"].mean())
+    print(f"  [Analysis Result] NLOS Edge Detection ROC AUC:")
+    print(f"    Learned SMACOF Weights: AUC = {mean_auc_learned:.4f}")
+    print(f"    Classical Huber Weights: AUC = {mean_auc_huber:.4f}")
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+    if all_w_clean_learned and all_w_nlos_learned:
+        axes[0].boxplot([all_w_clean_learned, all_w_nlos_learned], labels=["Clean Edges", "NLOS Edges"])
+        axes[0].set_ylabel("Edge Weight $w_{ij}$")
+        axes[0].set_title(f"Learned SMACOF Gate (AUC = {mean_auc_learned:.3f})")
+        axes[0].grid(True, alpha=0.3)
+
+        axes[1].boxplot([all_w_clean_huber, all_w_nlos_huber], labels=["Clean Edges", "NLOS Edges"])
+        axes[1].set_ylabel("Edge Weight $w_{ij}$")
+        axes[1].set_title(f"Classical Huber IRLS (AUC = {mean_auc_huber:.3f})")
+        axes[1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        save_fig_both("fig_nlos_edge_weights.png", dpi=150)
+
+
+def run_fair_runtime_benchmark(graphs, models, baselines):
+    """
+    Executes a 100% fair single-threaded CPU runtime benchmark across all methods.
+    - Representative sampling: samples 1 graph per (scenario, missing level) cell.
+    - Single-threaded environment: sets BLAS/OMP/MKL threads to 1 and torch.set_num_threads(1).
+    - Measures both feature extraction and inference for GNN, plus Ours + Huber polish.
+    - Runs untimed warm-up passes to eliminate JIT/initialisation bias.
+    - Avoids in-place model mutation via copy.deepcopy.
+    """
+    import copy
+    from common import build_features
+
+    # 1. Representative sampling: 1 graph per (scenario, missing) cell
+    cell_dict = {}
+    for g in graphs:
+        cell_key = (g.get("scenario", "default"), g.get("missing_nominal", 0.0))
+        if cell_key not in cell_dict:
+            cell_dict[cell_key] = g
+    sample_graphs = list(cell_dict.values())
+    n_sample = len(sample_graphs)
+    print(f"\n[Benchmark] Running fair single-threaded CPU runtime benchmark on {n_sample} representative graphs (1 per cell)...", flush=True)
+
+    prev_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    for env_var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[env_var] = "1"
+
+    records = []
+
+    # 2. GNN on CPU with feature building and polish included
+    if OURS in models:
+        gnn_cpu = copy.deepcopy(models[OURS]).to("cpu").eval()
+
+        # Warm-up passes (untimed)
+        warmup_B = collate([sample_graphs[0]], "cpu")
+        with torch.no_grad():
+            for _ in range(3):
+                _ = gnn_cpu(warmup_B, T=C.TEST_REFINE_STEPS)
+
+        t_feats, t_fwds, t_polish = [], [], []
+        for g in sample_graphs:
+            # Dijkstra shortest path + multilateration feature building
+            t0 = time.perf_counter()
+            _ = build_features(g["n"], g["edges"], g["d_obs"], g["anchors"], g["anchor_xy"])
+            t_feats.append(time.perf_counter() - t0)
+
+            # GNN Forward Pass
+            B = collate([g], "cpu")
+            t0 = time.perf_counter()
+            with torch.no_grad():
+                x_out, _ = gnn_cpu(B, T=C.TEST_REFINE_STEPS)
+            t_fwds.append(time.perf_counter() - t0)
+            X_pred = to_original_units(B, x_out)[0]
+
+            # Huber Polish
+            t0 = time.perf_counter()
+            _ = BL.stress_lbfgs(g, X_pred, robust=True)
+            t_polish.append(time.perf_counter() - t0)
+
+        mean_feat_ms = float(np.mean(t_feats)) * 1000.0
+        mean_fwd_ms = float(np.mean(t_fwds)) * 1000.0
+        mean_pol_ms = float(np.mean(t_polish)) * 1000.0
+
+        records.append(dict(
+            method="Ours: AnchorGNN (features + CPU forward)",
+            total_ms=mean_feat_ms + mean_fwd_ms,
+            feature_ms=mean_feat_ms,
+            inference_ms=mean_fwd_ms,
+            polish_ms=0.0,
+            hardware="Single-core CPU"
+        ))
+        records.append(dict(
+            method="Ours: AnchorGNN + Huber polish (features + forward + polish)",
+            total_ms=mean_feat_ms + mean_fwd_ms + mean_pol_ms,
+            feature_ms=mean_feat_ms,
+            inference_ms=mean_fwd_ms,
+            polish_ms=mean_pol_ms,
+            hardware="Single-core CPU"
+        ))
+
+    # 3. Key baselines sequentially on single-core CPU
+    eval_base = ["MDS-MAP", "MDS-MAP + Huber stress", "DV-distance + Huber polish", "SDP (Biswas-Ye)", "SDP + Huber polish"]
+    for b_name in eval_base:
+        if b_name not in baselines:
+            continue
+        fn = baselines[b_name]
+        t_list = []
+        for g in sample_graphs:
+            g.pop("_sdp", None); g.pop("_sdp_time", None)   # no cached SDP: time the full solve
+            t0 = time.perf_counter()
+            _ = fn(g)
+            t_list.append(time.perf_counter() - t0)
+        mean_base_ms = float(np.mean(t_list)) * 1000.0
+        records.append(dict(
+            method=b_name,
+            total_ms=mean_base_ms,
+            feature_ms=0.0,
+            inference_ms=mean_base_ms,
+            polish_ms=0.0,
+            hardware="Single-core CPU"
+        ))
+
+    torch.set_num_threads(prev_threads)
+    df_rt = pd.DataFrame(records)
+    df_rt.to_csv(os.path.join(C.RESULTS_DIR, "fair_runtime_benchmark.csv"), index=False)
+    print("\nFAIR RUNTIME BENCHMARK (Single-core CPU, representative sample, features included):")
+    print(df_rt.to_string(index=False), flush=True)
+
+
+def run_paired_wilcoxon_tests(df, out_dir=None):
+    """
+    Computes rigorous non-parametric paired Wilcoxon signed-rank tests
+    on globally rigid graphs at 60-85% missing distance constraints.
+    Saves results/paired_tests.csv.
+    """
+    from scipy.stats import wilcoxon
+    out_dir = out_dir or C.RESULTS_DIR
+    d = df[df.globally_rigid.astype(bool) & df.missing.between(60, 85)]
+    if d.empty:
+        return None
+
+    pairs = [
+        (OURS + " + Huber polish", "SDP + Huber polish", False),
+        (OURS + " + Huber polish", "MDS-MAP + Huber stress", False),
+        (OURS + " + Huber polish", "DV-distance + Huber polish", False),
+        (OURS + " + Huber polish", "Random (multi-start) + Huber polish", False),
+        (OURS, "Ablation: encoder + Huber-weight steps", True),
+        (OURS, "Ablation: Huber weights + learned alpha", True),
+    ]
+
+    rows = []
+    for a, b, nlos_only in pairs:
+        dd = d[d.scenario.str.endswith("nlos")] if nlos_only else d
+        p = dd.pivot_table(index=["scenario", "missing", "graph_id"], columns="method", values="rmse")
+        if a not in p or b not in p:
+            continue
+        valid = p[[a, b]].dropna()
+        if len(valid) < 5:
+            continue
+        diff = valid[a] - valid[b]
+        if (diff == 0).all():
+            stat, p_val = 0.0, 1.0
+        else:
+            try:
+                res = wilcoxon(diff, alternative="two-sided")
+                stat, p_val = float(res.statistic), float(res.pvalue)
+            except Exception:
+                stat, p_val = np.nan, np.nan
+        w = int((diff < 0).sum())
+        l = int((diff > 0).sum())
+        t = int((diff == 0).sum())
+        p_fail = dd.pivot_table(index=["scenario", "missing", "graph_id"], columns="method", values="fail_10")
+        f_a = float(p_fail[a].mean()) if a in p_fail else np.nan
+        f_b = float(p_fail[b].mean()) if b in p_fail else np.nan
+        rows.append(dict(
+            method_A=a, method_B=b, nlos_only=nlos_only, n_pairs=len(valid),
+            wins_A=w, losses_A=l, ties=t, win_rate_A=round(w / max(1, w + l), 3),
+            mean_rmse_A=round(float(valid[a].mean()), 4),
+            mean_rmse_B=round(float(valid[b].mean()), 4),
+            fail_rate_A=round(f_a, 4), fail_rate_B=round(f_b, 4),
+            wilcoxon_stat=stat, p_value=p_val
+        ))
+    if rows:
+        res_df = pd.DataFrame(rows)
+        out_csv = os.path.join(out_dir, "paired_tests.csv")
+        res_df.to_csv(out_csv, index=False)
+        print(f"\n[Statistical Hypothesis Testing] Paired Wilcoxon Signed-Rank Tests (Globally Rigid, 60-85% Missing):")
+        print(res_df[["method_A", "method_B", "n_pairs", "win_rate_A", "mean_rmse_A", "mean_rmse_B", "p_value"]].to_string(index=False), flush=True)
+        return res_df
+    return None
+
+
 def main():
     import sys
     if "--transfer" in sys.argv:
         run_transfer(plot_only="--plot-only" in sys.argv); return
+    if "--extended" in sys.argv:
+        run_extended_sweeps(plot_only="--plot-only" in sys.argv); return
+    if "--fair-runtime" in sys.argv:
+        run_fair_runtime_benchmark(load("test.pkl"), load_models(), BL.get_baselines(C, device="cpu")); return
     if "--plot-only" in sys.argv:          # redraw figures from saved results, no re-running
         main_plots(pd.read_csv(os.path.join(C.RESULTS_DIR, "all_results.csv")))
         print("figures redrawn"); return
+
+
     mode_info = f"Dual-GPU mode ({', '.join(DEVICES)})" if len(DEVICES) >= 2 else f"Device: {DEVICE}"
     print(f"STEP 3: evaluation on {mode_info}", flush=True)
     models = load_models()
@@ -459,6 +899,7 @@ def main():
     print("  models:", list(models), flush=True)
     baselines = BL.get_baselines(C, device=DEVICE)
     test = load("test.pkl")
+    dump_run_config(C.RESULTS_DIR, step_name="step3")
 
 
     # ---------------- main comparison ----------------
@@ -466,20 +907,45 @@ def main():
     df.to_csv(os.path.join(C.RESULTS_DIR, "all_results.csv"), index=False)
     summ = (df.groupby(["scenario", "missing", "method"])
               .agg(rmse_mean=("rmse", "mean"), rmse_std=("rmse", "std"), rmse_median=("rmse", "median"),
-                   rmse_cert_mean=("rmse_certified", "mean"), rel_edm_mean=("rel_edm", "mean"),
+                   rmse_p90=("rmse", lambda x: float(np.percentile(x, 90))),
+                   catastrophic_fail_rate=("catastrophic_fail", "mean"),
+                   fail_rate_05=("fail_05", "mean"),
+                   fail_rate_10=("fail_10", "mean"),
+                   fail_rate_15=("fail_15", "mean"),
+                   fail_rate_20=("fail_20", "mean"),
+                   rmse_cert_mean=("rmse_certified", "mean"),
+                   rmse_crlb_subset_mean=("rmse_crlb_subset", "mean"),
+                   rel_edm_mean=("rel_edm", "mean"),
+                   crlb_mean=("crlb", "mean"),
                    sec_per_graph=("seconds", "mean"), frac_rigid=("globally_rigid", "mean"))
               .reset_index())
     summ.to_csv(os.path.join(C.RESULTS_DIR, "summary_table.csv"), index=False)
+    run_paired_wilcoxon_tests(df, C.RESULTS_DIR)
+
+
+    sdp_fb = BL.get_sdp_fallbacks()
+    if sdp_fb > 0:
+        print(f"\n[NOTE] SDP Solver Fallbacks: {sdp_fb} evaluation graph(s) fell back to MDS-MAP.", flush=True)
+    else:
+        print("\n[NOTE] SDP Solver: 0 fallbacks (all evaluated SDP instances solved directly).", flush=True)
 
     main_plots(df)
 
-    show = [m for m in [OURS, "MDS-MAP + Huber stress", "SDP (Biswas-Ye)", "Yan et al. GCN (3 anchor labels)", "MPNN-Loc (Xu & Lin 2025)"]
+    show = [m for m in [OURS, OURS + " + Huber polish", "MDS-MAP + Huber stress", "DV-distance + Huber polish", "SDP (Biswas-Ye)", "SDP + Huber polish", "MPNN-Loc (Xu & Lin 2025)"]
             if m in preds]
     plot_examples(test, preds, show, "fig_examples.png")
+
+    analyze_nlos_weights(models, test)
+    if getattr(C, "RUN_CPU_TIMING", False):
+        run_fair_runtime_benchmark(test, models, baselines)
+
+
 
     # ---------------- printed table ----------------
     piv = summ.pivot_table(index=["scenario", "missing"], columns="method", values="rmse_mean")
     print("\nMEAN COORDINATE RMSE (lower is better)\n", piv.round(3).to_string())
+    piv_med = summ.pivot_table(index=["scenario", "missing"], columns="method", values="rmse_median")
+    print("\nMEDIAN COORDINATE RMSE (lower is better)\n", piv_med.round(3).to_string())
 
     # ---------------- generalisation to bigger graphs ----------------
     fast = {k: v for k, v in baselines.items() if "Per-graph" not in k and "Yan" not in k and "MPNN-Loc" not in k}

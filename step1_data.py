@@ -18,10 +18,10 @@ synthetic training graphs and for scoring).
 
 Run:  python step1_data.py
 """
-import pickle, time, os
+import pickle, time, os, glob
 import numpy as np
 import config as C
-from common import make_graph, ba_reachable
+from common import make_graph, ba_reachable, dump_run_config
 
 
 def save(obj, name):
@@ -29,6 +29,7 @@ def save(obj, name):
     with open(path, "wb") as f:
         pickle.dump(obj, f, protocol=4)
     print(f"  saved {len(obj):5d} graphs -> {path}")
+
 
 
 def mixed_set(rng, count, types=None, label=""):
@@ -81,9 +82,48 @@ def summary(graphs, title):
           .round(2).to_string(), flush=True)
 
 
+def make_extended_sets(rng):
+    if not getattr(C, "RUN_EXTENDED_EXPERIMENTS", False) and os.environ.get("RUN_EXTENDED") != "1":
+        return
+    print("  Generating extended experiment test sets...", flush=True)
+    k_vals = getattr(C, "ANCHOR_COUNTS", [3, 4, 5, 6, 7, 8])
+    n_per_k = getattr(C, "EXTENDED_TEST_PER_LEVEL", 20)
+
+    # 1. Anchor sweep graphs: varying K, N=50, 50% missing
+    anchor_graphs = []
+    for k in k_vals:
+        for gt, nz in [("rgg", "nlos"), ("random", "nlos")]:
+            for i in range(n_per_k):
+                g = make_graph(rng, C.N_NODES, gt, 0.50, C.NOISE_MODELS[nz], n_anchors=k)
+                g.update(scenario=f"{gt}/{nz}", noise=nz, anchor_k=k, graph_id=len(anchor_graphs))
+                anchor_graphs.append(g)
+    save(anchor_graphs, "anchor_sweep_test.pkl")
+    print(f"    Anchor sweep test set generated ({len(anchor_graphs)} graphs)", flush=True)
+
+    # 2. NLOS sweep graphs: varying p_nlos, N=50, 50% missing, 3 anchors
+    nlos_graphs = []
+    p_vals = getattr(C, "NLOS_PROBABILITIES", [0.0, 0.1, 0.2, 0.3, 0.4, 0.5])
+    for p in p_vals:
+        for gt in ["rgg", "random"]:
+            nz = dict(sigma=0.02, p_nlos=float(p), nlos_max=4.0)
+            for i in range(n_per_k):
+                g = make_graph(rng, C.N_NODES, gt, 0.50, nz, n_anchors=3)
+                g.update(scenario=f"{gt}/nlos", p_nlos=float(p), graph_id=len(nlos_graphs))
+                nlos_graphs.append(g)
+    save(nlos_graphs, "nlos_sweep_test.pkl")
+    print(f"    NLOS sweep test set generated ({len(nlos_graphs)} graphs)", flush=True)
+
+
 if __name__ == "__main__":
     t0 = time.time()
+    dump_run_config(step_name="step1")
+    # Clear baseline evaluation caches if regenerating data
+    for _bf in glob.glob(os.path.join(C.DATA_DIR, "baseline_cache*.pkl")):
+        try: os.remove(_bf)
+        except Exception: pass
+
     print("STEP 1: generating datasets", flush=True)
+
     print("  [1/4] Generating training set...", flush=True)
     save(mixed_set(np.random.default_rng(C.SEED), C.N_TRAIN, label="train"), "train.pkl")
     print("  [2/4] Generating validation set...", flush=True)
@@ -121,4 +161,6 @@ if __name__ == "__main__":
             print(f"    BA m={m} generated ({len(ba)} graphs)", flush=True)
         save(ba, "test_ba.pkl")
 
+    make_extended_sets(np.random.default_rng(C.SEED + 99))
     print(f"\nSTEP 1 done in {time.time() - t0:.0f}s", flush=True)
+

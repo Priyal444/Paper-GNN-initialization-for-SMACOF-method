@@ -9,6 +9,7 @@ common.py -- shared building blocks used by step1 / step2 / step3.
     6. features           : E(2)-equivariant features (supports any K >= 3 anchors)
     7. metrics            : coordinate RMSE, certified RMSE, relative EDM error
 """
+import os
 import numpy as np
 import networkx as nx
 from scipy.sparse import csr_matrix
@@ -54,7 +55,9 @@ def canonical_anchor_frame(anchor_xy):
       1. Translation: origin = centroid c of the 3 reference anchors
       2. Scale: unit = mean pairwise distance s of the 3 reference anchors
       3. Rotation: align vector (anchor_1 - anchor_0) with positive x-axis
-      4. Reflection: flip y-axis so anchor_2 lies in the upper half-plane (y >= 0)
+    Reference anchors are canonically ordered by intrinsic triangle geometry
+    (vertex opposite longest side first, then next-longest), ensuring complete
+    invariance under rotation, reflection, and arbitrary node indexing.
     Returns (c, s, R, tri) where R is a (2, 2) orthogonal matrix in O(2) such that:
       X_can = ((X_orig - c) / s) @ R
       X_orig = (X_can @ R.T) * s + c
@@ -62,6 +65,15 @@ def canonical_anchor_frame(anchor_xy):
     tri = best_anchor_triangle(anchor_xy)
     A3 = anchor_xy[tri].astype(np.float64)
     c = A3.mean(0)
+    # Order reference anchors by intrinsic triangle geometry (invariant to rotation, reflection and relabelling):
+    # Vertex opposite the longest side first, then next-longest.
+    # Note: ambiguous for exactly isosceles triangles (measure zero for generic random coordinates).
+    opp = np.array([np.linalg.norm(A3[1] - A3[2]),
+                    np.linalg.norm(A3[0] - A3[2]),
+                    np.linalg.norm(A3[0] - A3[1])])
+    order = np.argsort(-opp)
+    tri, A3 = tri[order], A3[order]
+
     s = np.mean([np.linalg.norm(A3[i] - A3[j]) for i in range(3) for j in range(i + 1, 3)])
     s = max(float(s), 1e-6)
     A_s = (A3 - c) / s
@@ -159,13 +171,20 @@ def is_connected(n, edges):
 # =============================================================================
 # 3. Noise (on RAW distances)
 # =============================================================================
-def noisy_distances(d_true, rng, sigma=0.0, p_nlos=0.0, nlos_max=0.0):
+def noisy_distances(d_true, rng, sigma=0.0, p_nlos=0.0, nlos_max=0.0, return_mask=False):
     """d_obs = d (1 + sigma*eps) + b * U[0, nlos_max],  b ~ Bernoulli(p_nlos)."""
     d = d_true * (1.0 + sigma * rng.standard_normal(d_true.shape))
+    is_nlos = np.zeros(d_true.shape, dtype=bool)
     if p_nlos > 0:
-        bias = rng.uniform(0, nlos_max, d_true.shape) * (rng.random(d_true.shape) < p_nlos)
+        mask = rng.random(d_true.shape) < p_nlos
+        bias = rng.uniform(0, nlos_max, d_true.shape) * mask
         d = d + bias
-    return np.maximum(d, 1e-3)
+        is_nlos = mask & (bias > 0)
+    d_out = np.maximum(d, 1e-3)
+    if return_mask:
+        return d_out, is_nlos
+    return d_out
+
 
 
 # =============================================================================
@@ -265,11 +284,13 @@ def globally_rigid(n, edges, anchors, rng, d=2, tol=1e-8):
 # =============================================================================
 # 6. Features  -- built ONLY from observed distances + anchor coordinates
 # =============================================================================
-def geodesic_matrix(n, edges, d_obs):
-    """Shortest-path lengths through the observed graph (n, n)."""
+def geodesic_matrix(n, edges, d_obs, indices=None):
+    """Shortest-path lengths through the observed graph.
+    If indices is provided, calculates single-source shortest paths only from indices,
+    returning shape (len(indices), n). Otherwise calculates full (n, n) matrix."""
     W = csr_matrix((np.r_[d_obs, d_obs], (np.r_[edges[:, 0], edges[:, 1]],
                                          np.r_[edges[:, 1], edges[:, 0]])), shape=(n, n))
-    return shortest_path(W, directed=False)
+    return shortest_path(W, directed=False, indices=indices)
 
 
 def hop_matrix(n, edges, rows):
@@ -304,7 +325,7 @@ def build_features(n, edges, d_obs, anchors, anchor_xy):
     A_n = ((anchor_xy - c) / s) @ R
     d_n = d_obs / s
 
-    G_all = geodesic_matrix(n, edges, d_n)[:, anchors]              # (n, K)
+    G_all = geodesic_matrix(n, edges, d_n, indices=anchors).T       # (n, K)
     H_all = hop_matrix(n, edges, anchors).T                         # (n, K)
     x0 = multilaterate(A_n, G_all)
     x0[anchors] = A_n
@@ -359,7 +380,7 @@ def make_graph(rng, n, graph_type, missing, noise, n_anchors=3, coord_range=10.0
     else:
         raise ValueError(graph_type)
     d_true = np.linalg.norm(P[edges[:, 0]] - P[edges[:, 1]], axis=1)
-    d_obs = noisy_distances(d_true, rng, **noise)
+    d_obs, is_nlos = noisy_distances(d_true, rng, return_mask=True, **noise)
     anchors = pick_anchors(P, n_anchors, rng)
     feats = build_features(n, edges, d_obs, anchors, P[anchors])
     total = n * (n - 1) // 2
@@ -369,6 +390,7 @@ def make_graph(rng, n, graph_type, missing, noise, n_anchors=3, coord_range=10.0
         n=n, graph_type=graph_type, missing_nominal=float(missing),
         missing_actual=1.0 - len(edges) / total,
         edges=edges, d_obs=d_obs.astype(np.float32),
+        is_nlos=is_nlos.astype(bool),
         anchors=anchors, anchor_xy=P[anchors].astype(np.float32),
         true_xy=P.astype(np.float32),
         certified=cert,            # nodes whose position is provably unique
@@ -376,6 +398,7 @@ def make_graph(rng, n, graph_type, missing, noise, n_anchors=3, coord_range=10.0
         ba_m=ba_m,                 # None unless graph_type == "ba"
         **feats,
     )
+
 
 
 # =============================================================================
@@ -399,3 +422,138 @@ def rel_edm_error(g, X):
     """||D_hat - D||_F / ||D||_F on raw distances (blind to reflections)."""
     D, Dh = dist_matrix(g["true_xy"]), dist_matrix(X)
     return float(np.linalg.norm(D - Dh) / np.linalg.norm(D))
+
+
+def cramer_rao_lower_bound(g, sigma=None):
+    """
+    Computes the theoretical Cramér-Rao Lower Bound (CRLB) on coordinate RMSE
+    under additive Gaussian range noise (Patwari et al., IEEE SPM 2005).
+    FIM J is of size 2(N-K) x 2(N-K) over unknown sensor nodes.
+    Returns sqrt( (1 / (N-K)) * Tr(J^{-1}) ) in coordinate units (meters),
+    or NaN if the network is non-rigid / rank-deficient.
+    """
+    n = g["n"]
+    anchors = set(g["anchors"])
+    P = g["true_xy"]
+    edges = g["edges"]
+    unk = [k for k in range(n) if k not in anchors]
+    m = len(unk)
+    if m == 0:
+        return 0.0
+    idx_map = {node: k for k, node in enumerate(unk)}
+    diff_all = P[edges[:, 0]] - P[edges[:, 1]]
+    d_true = np.linalg.norm(diff_all, axis=1)
+
+    if sigma is None:
+        nz = g.get("noise")
+        sig_frac = nz.get("sigma", 0.05) if isinstance(nz, dict) else 0.05
+    else:
+        sig_frac = sigma
+
+    FIM = np.zeros((2 * m, 2 * m), dtype=np.float64)
+    for (u_node, v_node), d_ij in zip(edges, d_true):
+        if d_ij < 1e-9:
+            continue
+        sig_ij = max(sig_frac * d_ij, 1e-4)
+        # Slepian-Bangs formula under multiplicative range noise d_obs ~ N(d, sigma^2 d^2):
+        # differentiating both mean and covariance gives w = (1 + 2*sigma^2) / (sigma^2 d^2)
+        w = (1.0 + 2.0 * (sig_frac ** 2)) / (sig_ij ** 2)
+        u_vec = (P[u_node] - P[v_node]) / d_ij
+        uuT = np.outer(u_vec, u_vec) * w
+
+        i_unk = u_node in idx_map
+        j_unk = v_node in idx_map
+        if i_unk and j_unk:
+            idx_i, idx_j = idx_map[u_node], idx_map[v_node]
+            FIM[2*idx_i:2*idx_i+2, 2*idx_i:2*idx_i+2] += uuT
+            FIM[2*idx_j:2*idx_j+2, 2*idx_j:2*idx_j+2] += uuT
+            FIM[2*idx_i:2*idx_i+2, 2*idx_j:2*idx_j+2] -= uuT
+            FIM[2*idx_j:2*idx_j+2, 2*idx_i:2*idx_i+2] -= uuT
+        elif i_unk and not j_unk:
+            idx_i = idx_map[u_node]
+            FIM[2*idx_i:2*idx_i+2, 2*idx_i:2*idx_i+2] += uuT
+        elif not i_unk and j_unk:
+            idx_j = idx_map[v_node]
+            FIM[2*idx_j:2*idx_j+2, 2*idx_j:2*idx_j+2] += uuT
+
+    try:
+        evals, evecs = np.linalg.eigh(FIM)
+        if evals.min() <= 1e-7:
+            return np.nan
+        inv_FIM = evecs @ np.diag(1.0 / evals) @ evecs.T
+        return float(np.sqrt(np.trace(inv_FIM) / m))
+    except Exception:
+        return np.nan
+
+
+
+def dump_run_config(out_dir=None, step_name=None):
+    """
+    Dumps all resolved configuration parameters, git commit hash, environment,
+    hardware specs, and library versions to results/config_used.json for reproducibility.
+    """
+    import os, json, sys, platform, subprocess, datetime
+    import config as C
+    out_dir = out_dir or C.RESULTS_DIR
+    os.makedirs(out_dir, exist_ok=True)
+
+    cfg_dict = {}
+    for k in dir(C):
+        if not k.startswith("_") and k.isupper():
+            val = getattr(C, k)
+            if isinstance(val, (int, float, str, bool, list, dict, tuple)):
+                cfg_dict[k] = val
+            else:
+                cfg_dict[k] = str(val)
+
+    git_hash = "unknown"
+    try:
+        r = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            git_hash = r.stdout.strip()
+    except Exception:
+        pass
+
+    packages = {
+        "python": sys.version,
+        "platform": platform.platform(),
+    }
+    for pkg in ("torch", "numpy", "scipy", "pandas", "matplotlib", "cvxpy"):
+        try:
+            mod = __import__(pkg)
+            packages[pkg] = getattr(mod, "__version__", "installed")
+        except ImportError:
+            packages[pkg] = "not installed"
+
+    hardware = {
+        "cpu_count": os.cpu_count(),
+    }
+    try:
+        import torch
+        hardware["cuda_available"] = torch.cuda.is_available()
+        hardware["cuda_device_count"] = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        if torch.cuda.is_available():
+            hardware["devices"] = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+    except Exception:
+        pass
+
+    info = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "step": step_name or "general",
+        "git_commit": git_hash,
+        "hardware": hardware,
+        "packages": packages,
+        "config": cfg_dict,
+    }
+
+    target_path = os.path.join(out_dir, "config_used.json")
+    with open(target_path, "w") as f:
+        json.dump(info, f, indent=2)
+    if step_name:
+        step_path = os.path.join(out_dir, f"config_used_{step_name}.json")
+        with open(step_path, "w") as f:
+            json.dump(info, f, indent=2)
+    print(f"  [Config Dump] Saved run configuration & environment -> {target_path}", flush=True)
+    return info
+
+
