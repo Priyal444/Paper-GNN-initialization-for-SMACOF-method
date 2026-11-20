@@ -39,16 +39,18 @@ NOISE_MODELS = {
 # ----------------------------------------------------------------------------
 # Datasets (step 1)
 # ----------------------------------------------------------------------------
-N_TRAIN          = 3000      # training graphs (random missing %, noise, type)
-N_VAL            = 400
-TRAIN_N_RANGE    = (30, 80)  # train on VARIABLE sizes -> generalises in n
+N_TRAIN          = 10000     # training graphs
+N_VAL            = 1000      # validation graphs
+TRAIN_N_RANGE    = (50, 50)  # train strictly on n=50 -> tests zero-shot size generalization
 TRAIN_MISSING    = (0.10, 0.90)
+TEST_PER_LEVEL   = 40        # 20 per cell * 64 cells = 1,280 test graphs for n=50 (>= 1,000 graphs)
 TEST_SCENARIOS   = [("random", "clean"), ("random", "gauss"), ("random", "nlos"),
                     ("rgg", "clean"),    ("rgg", "gauss"),    ("rgg", "nlos"),
                     ("ba", "clean"),     ("ba", "nlos")]
-GENERALISE_SIZES = [100, 200]          # extra test sets, never seen in training
+GENERALISE_SIZES = [100, 200, 500, 1000]  # size generalisation: n=100, 200, 500, 1000
 GENERALISE_SCENARIO = ("rgg", "nlos")
 GENERALISE_LEVELS = [0.5, 0.7, 0.9]
+GEN_TEST_PER_LEVEL = 15      # 15 * 3 levels = 45 graphs per size (up to 45,000 node evaluations)
 BA_M_VALUES      = [1, 2, 3, 4, 5]     # rigidity-threshold experiment
 BA_PER_M         = 20
 
@@ -120,7 +122,8 @@ for _d in (DATA_DIR, CKPT_DIR, RESULTS_DIR):
 
 
 # Any of these can be overridden from the environment, e.g.  EPOCHS=10 python step2_train.py
-for _k in ("N_TRAIN", "N_VAL", "TEST_PER_LEVEL", "BA_PER_M", "EPOCHS", "PERGRAPH_EPOCHS", "REFINE_STEPS",
+for _k in ("N_TRAIN", "N_VAL", "TEST_PER_LEVEL", "GEN_TEST_PER_LEVEL", "EXTENDED_TEST_PER_LEVEL",
+           "BA_PER_M", "EPOCHS", "PERGRAPH_EPOCHS", "REFINE_STEPS",
            "TEST_REFINE_STEPS", "MPNN_LOC_EPOCHS"):
     if _k in os.environ:
         globals()[_k] = int(os.environ[_k])

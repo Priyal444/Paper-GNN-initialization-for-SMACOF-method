@@ -94,6 +94,8 @@ def load_models(transfer=False):
 def run_gnn(model, graphs, bs=64):
     """One forward pass per batch; parallel across available GPUs."""
     import copy, concurrent.futures
+    avg_n = int(np.mean([g.get('n', 50) for g in graphs])) if graphs else 50
+    bs = max(1, min(bs, 2000 // max(1, avg_n)))
     if len(DEVICES) >= 2 and len(graphs) >= 2:
         models_per_dev = [model if dev == DEVICE else copy.deepcopy(model).to(dev).eval()
                           for dev in DEVICES]
@@ -205,7 +207,8 @@ def evaluate_set(graphs, models, baselines, polish=True, label=""):
             n_cpu_workers = min(os.cpu_count() or 4, 8)
             print(f"{label} [Polish] Running Huber L-BFGS polish on {n_graphs} graphs (parallel across {n_cpu_workers} CPU workers)...", flush=True)
             t_pol_start = time.time()
-            log_step = max(1, n_graphs // 5)
+            log_step = min(50, max(5, n_graphs // 20))
+            last_log_t = time.time()
             
             def polish_one(item):
                 idx, g, X = item
@@ -227,10 +230,12 @@ def evaluate_set(graphs, models, baselines, polish=True, label=""):
                     polish_rows[idx] = score_rows(graphs[idx], name + " + Huber polish", Y, sec + dur)
                     with print_lock:
                         completed += 1
-                        if completed % log_step == 0 or completed == n_graphs:
-                            elapsed = time.time() - t_pol_start
+                        now = time.time()
+                        if completed % log_step == 0 or completed == n_graphs or (now - last_log_t >= 10.0):
+                            elapsed = now - t_pol_start
                             eta = (elapsed / completed) * (n_graphs - completed)
-                            print(f"    progress: {completed}/{n_graphs} polished ({completed*100//n_graphs}%) | elapsed: {elapsed:.1f}s | ETA: {eta:.1f}s", flush=True)
+                            last_log_t = now
+                            print(f"    [Polish progress] {completed}/{n_graphs} graphs ({completed*100//n_graphs}%) | elapsed: {elapsed:.1f}s | ETA: {eta:.1f}s", flush=True)
 
             rows.extend(polish_rows)
             preds[name + " + Huber polish"] = P2
@@ -284,7 +289,8 @@ def evaluate_set(graphs, models, baselines, polish=True, label=""):
         t0 = time.time()
         P = [None] * n_graphs
         base_rows = [None] * n_graphs
-        log_step = max(1, n_graphs // 5)
+        log_step = min(50, max(5, n_graphs // 20))
+        last_log_t = time.time()
         completed = 0
         print_lock = threading.Lock()
 
@@ -294,7 +300,7 @@ def evaluate_set(graphs, models, baselines, polish=True, label=""):
             target_fn = base_per_dev[dev].get(name, fn)
             had_sdp = g.get("_sdp") is not None
             X, sec = BL.timed(target_fn, g)
-            if name == "SDP + Huber polish" and had_sdp:
+            if name.startswith("SDP + ") and had_sdp:
                 sec += g.get("_sdp_time", 0.0)   # count reused SDP solve duration
             return k, X, sec
 
@@ -306,10 +312,13 @@ def evaluate_set(graphs, models, baselines, polish=True, label=""):
                 base_rows[k] = score_rows(graphs[k], name, X, sec)
                 with print_lock:
                     completed += 1
-                    if completed % log_step == 0 or completed == n_graphs:
-                        elapsed = time.time() - t0
+                    now = time.time()
+                    if completed % log_step == 0 or completed == n_graphs or (now - last_log_t >= 10.0):
+                        elapsed = now - t0
                         eta = (elapsed / completed) * (n_graphs - completed)
-                        print(f"    progress: {completed}/{n_graphs} graphs ({completed*100//n_graphs}%) | elapsed: {elapsed:.1f}s | ETA: {eta:.1f}s", flush=True)
+                        last_log_t = now
+                        curr_rmse = np.nanmean([coord_rmse(graphs[j], P[j]) for j in range(n_graphs) if P[j] is not None])
+                        print(f"    progress: {completed}/{n_graphs} graphs ({completed*100//n_graphs}%) | elapsed: {elapsed:.1f}s | ETA: {eta:.1f}s | avg RMSE so far: {curr_rmse:.4f}", flush=True)
 
         preds[name] = P
         rows.extend(base_rows)
@@ -375,7 +384,7 @@ def plot_vs_missing(df, metric, methods, fname, title, ylabel):
     for ax, sc in zip(axes.ravel(), scen):
         d = df[df.scenario == sc]
         for mth in methods:
-            use_col = metric
+            use_col = "rmse_crlb_subset" if (metric == "rmse" and "gauss" in sc and "rmse_crlb_subset" in d.columns) else metric
             g = d[d.method == mth].groupby("missing")[use_col]
             if g.ngroups == 0: continue
             mean, q1, q3 = g.mean(), g.quantile(0.25), g.quantile(0.75)
@@ -654,11 +663,11 @@ def analyze_nlos_weights(models, graphs):
             x, xA, w_learned, x_prev = model(B, T=C.TEST_REFINE_STEPS, return_weights=True)
             w_learned = w_learned.detach().cpu().numpy()
 
-            # Classical Huber weights evaluated at identical x_prev positions (fair comparison)
+            # Classical Huber weights evaluated at initial Stage-A estimate xA (before unrolled refiner)
             ei = B["edge_index"].cpu().numpy()
             d = B["d_edge"].cpu().numpy()
             src, dst = ei[0], ei[1]
-            diff = (x_prev[dst] - x_prev[src]).cpu().numpy()
+            diff = (xA[dst] - xA[src]).cpu().numpy()
             dhat = np.maximum(np.linalg.norm(diff, axis=-1), 1e-4)
             r = np.abs(d - dhat)
             w_huber = np.clip(C.HUBER_DELTA / np.maximum(r, 1e-9), 1e-3, 1.0)
@@ -823,11 +832,16 @@ def run_paired_wilcoxon_tests(df, out_dir=None):
     """
     from scipy.stats import wilcoxon
     out_dir = out_dir or C.RESULTS_DIR
-    d = df[df.globally_rigid.astype(bool) & df.missing.between(60, 85)]
+    d = df[df.globally_rigid.astype(bool) & df.missing.between(10, 80)]
     if d.empty:
         return None
 
     pairs = [
+        (OURS, "SDP + Huber polish", True),
+        (OURS, "SDP + Asym polish (NLOS)", True),
+        (OURS, "SDP (Biswas-Ye)", True),
+        (OURS, "MDS-MAP + Huber stress", True),
+        (OURS, "DV-distance + Huber polish", True),
         (OURS + " + Huber polish", "SDP + Huber polish", False),
         (OURS + " + Huber polish", "MDS-MAP + Huber stress", False),
         (OURS + " + Huber polish", "DV-distance + Huber polish", False),
@@ -846,17 +860,17 @@ def run_paired_wilcoxon_tests(df, out_dir=None):
         if len(valid) < 5:
             continue
         diff = valid[a] - valid[b]
-        if (diff == 0).all():
+        if (diff.abs() <= 1e-4).all():
             stat, p_val = 0.0, 1.0
         else:
             try:
-                res = wilcoxon(diff, alternative="two-sided")
+                res = wilcoxon(diff[diff.abs() > 1e-4], alternative="two-sided")
                 stat, p_val = float(res.statistic), float(res.pvalue)
             except Exception:
                 stat, p_val = np.nan, np.nan
-        w = int((diff < 0).sum())
-        l = int((diff > 0).sum())
-        t = int((diff == 0).sum())
+        w = int((diff < -1e-4).sum())
+        l = int((diff > 1e-4).sum())
+        t = int((diff.abs() <= 1e-4).sum())
         p_fail = dd.pivot_table(index=["scenario", "missing", "graph_id"], columns="method", values="fail_10")
         f_a = float(p_fail[a].mean()) if a in p_fail else np.nan
         f_b = float(p_fail[b].mean()) if b in p_fail else np.nan
@@ -872,7 +886,7 @@ def run_paired_wilcoxon_tests(df, out_dir=None):
         res_df = pd.DataFrame(rows)
         out_csv = os.path.join(out_dir, "paired_tests.csv")
         res_df.to_csv(out_csv, index=False)
-        print(f"\n[Statistical Hypothesis Testing] Paired Wilcoxon Signed-Rank Tests (Globally Rigid, 60-85% Missing):")
+        print(f"\n[Statistical Hypothesis Testing] Paired Wilcoxon Signed-Rank Tests (Globally Rigid, 10-80% Missing):")
         print(res_df[["method_A", "method_B", "n_pairs", "win_rate_A", "mean_rmse_A", "mean_rmse_B", "p_value"]].to_string(index=False), flush=True)
         return res_df
     return None
@@ -903,6 +917,9 @@ def main():
 
 
     # ---------------- main comparison ----------------
+    print(f"\n=======================================================", flush=True)
+    print(f" [STAGE 1/4] Evaluating Main Benchmark (N=50, {len(test)} graphs)", flush=True)
+    print(f"=======================================================", flush=True)
     df, preds = evaluate_set(test, models, baselines, label="[main]")
     df.to_csv(os.path.join(C.RESULTS_DIR, "all_results.csv"), index=False)
     summ = (df.groupby(["scenario", "missing", "method"])
@@ -920,8 +937,9 @@ def main():
                    sec_per_graph=("seconds", "mean"), frac_rigid=("globally_rigid", "mean"))
               .reset_index())
     summ.to_csv(os.path.join(C.RESULTS_DIR, "summary_table.csv"), index=False)
+    
+    print(f"\n[STAGE 2/4] Statistical Wilcoxon Tests & Generating Publication Plots...", flush=True)
     run_paired_wilcoxon_tests(df, C.RESULTS_DIR)
-
 
     sdp_fb = BL.get_sdp_fallbacks()
     if sdp_fb > 0:
@@ -939,8 +957,6 @@ def main():
     if getattr(C, "RUN_CPU_TIMING", False):
         run_fair_runtime_benchmark(test, models, baselines)
 
-
-
     # ---------------- printed table ----------------
     piv = summ.pivot_table(index=["scenario", "missing"], columns="method", values="rmse_mean")
     print("\nMEAN COORDINATE RMSE (lower is better)\n", piv.round(3).to_string())
@@ -948,17 +964,23 @@ def main():
     print("\nMEDIAN COORDINATE RMSE (lower is better)\n", piv_med.round(3).to_string())
 
     # ---------------- generalisation to bigger graphs ----------------
+    print(f"\n=======================================================", flush=True)
+    print(f" [STAGE 3/4] Size Generalisation to Large Graphs (N = {C.GENERALISE_SIZES})", flush=True)
+    print(f"=======================================================", flush=True)
     fast = {k: v for k, v in baselines.items() if "Per-graph" not in k and "Yan" not in k and "MPNN-Loc" not in k}
     gen_rows = []
     for n in C.GENERALISE_SIZES:
         G = load(f"test_n{n}.pkl")
         if G is None: continue
         fb = {k: v for k, v in fast.items() if not (k.startswith("SDP") and n > C.SDP_MAX_N)}
+        print(f"\n--> Evaluating Size N = {n} ({len(G)} graphs) across {len(fb)+1} scalable methods...", flush=True)
         d, _ = evaluate_set(G, {OURS: models[OURS]} if OURS in models else models, fb, label=f"[n={n}]")
         gen_rows.append(d)
     if gen_rows:
         gd = pd.concat(gen_rows); gd.to_csv(os.path.join(C.RESULTS_DIR, "generalisation.csv"), index=False)
-        fig, axes = plt.subplots(1, len(C.GENERALISE_SIZES), figsize=(7 * len(C.GENERALISE_SIZES), 4.5), squeeze=False)
+        gen_piv = gd.groupby(["n", "missing", "method"]).rmse.mean().unstack("method")
+        print("\nGENERALISATION COORDINATE RMSE (by node count n):\n", gen_piv.round(3).to_string(), flush=True)
+        fig, axes = plt.subplots(1, len(C.GENERALISE_SIZES), figsize=(5.5 * len(C.GENERALISE_SIZES), 4.5), squeeze=False)
         for ax, n in zip(axes[0], C.GENERALISE_SIZES):
             d = gd[gd.n == n]
             for mth in d.method.unique():
@@ -972,6 +994,9 @@ def main():
     # ---------------- Barabasi-Albert rigidity threshold ----------------
     ba = load("test_ba.pkl")
     if ba is not None:
+        print(f"\n=======================================================", flush=True)
+        print(f" [STAGE 4/4] Barabasi-Albert Rigidity Phase Transition (m = {C.BA_M_VALUES})", flush=True)
+        print(f"=======================================================", flush=True)
         d, _ = evaluate_set(ba, {OURS: models[OURS]} if OURS in models else models, fast,
                             polish=False, label="[BA]")
         d.to_csv(os.path.join(C.RESULTS_DIR, "ba_results.csv"), index=False)

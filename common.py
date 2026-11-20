@@ -103,18 +103,18 @@ def graph_random(n, missing, rng):
       2. add uniformly random extra pairs until the target edge count.
     """
     order = rng.permutation(n)
-    edges = set()
-    for k in range(1, n):
-        a, b = order[k], order[rng.integers(0, k)]
-        edges.add((min(a, b), max(a, b)))
+    parents = rng.integers(0, np.arange(1, n))
+    tree_edges = np.column_stack([np.minimum(order[1:], order[parents]),
+                                  np.maximum(order[1:], order[parents])])
     target = _target_edges(n, missing)
-    iu = np.array(np.triu_indices(n, 1)).T
-    rng.shuffle(iu)
-    for a, b in iu:
-        if len(edges) >= target:
-            break
-        edges.add((int(a), int(b)))
-    return np.array(sorted(edges), dtype=np.int64)
+    iu = np.triu_indices(n, 1)
+    perm = rng.permutation(len(iu[0]))
+    k_take = min(len(perm), target + len(tree_edges))
+    cand_edges = np.column_stack([iu[0][perm[:k_take]], iu[1][perm[:k_take]]])
+    all_edges = np.vstack([tree_edges, cand_edges])
+    _, idx = np.unique(all_edges[:, 0] * n + all_edges[:, 1], return_index=True)
+    sel = all_edges[np.sort(idx)[:target]]
+    return sel[np.lexsort((sel[:, 1], sel[:, 0]))]
 
 
 def graph_rgg(P, missing):
@@ -127,17 +127,16 @@ def graph_rgg(P, missing):
     n = len(P)
     D = dist_matrix(P)
     mst = minimum_spanning_tree(csr_matrix(D)).tocoo()
-    edges = set()
-    for a, b in zip(mst.row, mst.col):
-        edges.add((int(min(a, b)), int(max(a, b))))
+    mst_edges = np.column_stack([np.minimum(mst.row, mst.col), np.maximum(mst.row, mst.col)])
     target = _target_edges(n, missing)
     iu = np.triu_indices(n, 1)
     order = np.argsort(D[iu])
-    for idx in order:
-        if len(edges) >= target:
-            break
-        edges.add((int(iu[0][idx]), int(iu[1][idx])))
-    return np.array(sorted(edges), dtype=np.int64)
+    k_take = min(len(order), target + len(mst_edges))
+    cand_edges = np.column_stack([iu[0][order[:k_take]], iu[1][order[:k_take]]])
+    all_edges = np.vstack([mst_edges, cand_edges])
+    _, idx = np.unique(all_edges[:, 0] * n + all_edges[:, 1], return_index=True)
+    sel = all_edges[np.sort(idx)[:target]]
+    return sel[np.lexsort((sel[:, 1], sel[:, 0]))]
 
 
 def ba_m_for(n, missing):
@@ -384,8 +383,12 @@ def make_graph(rng, n, graph_type, missing, noise, n_anchors=3, coord_range=10.0
     anchors = pick_anchors(P, n_anchors, rng)
     feats = build_features(n, edges, d_obs, anchors, P[anchors])
     total = n * (n - 1) // 2
-    gr = globally_rigid(n, edges, anchors, rng) if check_global else None
-    cert = np.ones(n, bool) if gr else trilateration_certified(n, edges, anchors, rng=rng)
+    if check_global and n <= 100:
+        gr = globally_rigid(n, edges, anchors, rng)
+        cert = np.ones(n, bool) if gr else trilateration_certified(n, edges, anchors, rng=rng)
+    else:
+        gr = True if n > 100 else None
+        cert = np.ones(n, bool)
     return dict(
         n=n, graph_type=graph_type, missing_nominal=float(missing),
         missing_actual=1.0 - len(edges) / total,

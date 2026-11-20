@@ -46,7 +46,7 @@ def mixed_set(rng, count, types=None, label=""):
             lo = max(lo, 0.5)
         mp = float(rng.uniform(lo, hi))
         nz = noise_names[rng.integers(len(noise_names))]
-        g = make_graph(rng, n, gt, mp, C.NOISE_MODELS[nz], C.N_ANCHORS, C.COORD_RANGE)
+        g = make_graph(rng, n, gt, mp, C.NOISE_MODELS[nz], C.N_ANCHORS, C.COORD_RANGE, check_global=False)
         g["noise"] = nz
         out.append(g)
         if len(out) % log_step == 0 or len(out) == count:
@@ -56,13 +56,14 @@ def mixed_set(rng, count, types=None, label=""):
 
 def scenario_set(rng, n, scenarios, levels, per_level):
     out = []
+    check_gr = (n <= 100)
     for gt, nz in scenarios:
         for mp in levels:
             if gt == "ba" and not ba_reachable(n, mp):
                 print(f"  skipping ba/{nz} at {mp:.0%} missing: BA needs >= ~50 % missing at n = {n}", flush=True)
                 continue
             for k in range(per_level):
-                g = make_graph(rng, n, gt, mp, C.NOISE_MODELS[nz], C.N_ANCHORS, C.COORD_RANGE)
+                g = make_graph(rng, n, gt, mp, C.NOISE_MODELS[nz], C.N_ANCHORS, C.COORD_RANGE, check_global=check_gr)
                 g.update(noise=nz, scenario=f"{gt}/{nz}", graph_id=k)
                 out.append(g)
             print(f"    test scenario {gt:6s} | noise: {nz:5s} | missing: {mp:.0%} ({len(out)} test graphs generated)", flush=True)
@@ -142,10 +143,11 @@ if __name__ == "__main__":
     summary(test, "TEST SET")
 
     if C.RUN_GENERALISATION:
+        gen_per_level = getattr(C, "GEN_TEST_PER_LEVEL", C.TEST_PER_LEVEL)
         print("  [4/4] Generating generalisation test sets...", flush=True)
         for n in C.GENERALISE_SIZES:
             gen = scenario_set(np.random.default_rng(C.SEED + 3 + n), n,
-                               [C.GENERALISE_SCENARIO], C.GENERALISE_LEVELS, C.TEST_PER_LEVEL)
+                               [C.GENERALISE_SCENARIO], C.GENERALISE_LEVELS, gen_per_level)
             save(gen, f"test_n{n}.pkl")
 
     if C.RUN_BA_EXPERIMENT:

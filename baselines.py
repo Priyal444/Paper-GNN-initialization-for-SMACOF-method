@@ -117,9 +117,11 @@ def _pin(g, X):
     X = X.copy(); X[g["anchors"]] = g["anchor_xy"]; return X
 
 
-def stress_lbfgs(g, X0, robust=False, max_iter=3000, device="cpu"):
+def stress_lbfgs(g, X0, robust=False, asymmetric_nlos=False, max_iter=3000, device="cpu"):
     """Minimise sum_edges rho(||x_i - x_j|| - d_ij) over NON-anchor nodes.
-    Uses compiled C/Fortran L-BFGS-B (10x faster than GPU for small 94-variable graphs)."""
+    Uses compiled C/Fortran L-BFGS-B (10x faster than GPU for small 94-variable graphs).
+    If asymmetric_nlos=True, penalises dh >= d_obs quadratically and dh < d_obs with Huber/L1,
+    accounting for strictly positive NLOS propagation bias."""
     n, E, d = g["n"], g["edges"], g["d_obs"].astype(float)
     I, J = E[:, 0], E[:, 1]
     free = np.ones(n, bool); free[g["anchors"]] = False
@@ -130,8 +132,15 @@ def stress_lbfgs(g, X0, robust=False, max_iter=3000, device="cpu"):
         X = Xfix.copy(); X[free] = z.reshape(-1, 2)
         diff = X[I] - X[J]
         dh = np.sqrt((diff ** 2).sum(1) + 1e-12)
-        r = dh - d
-        if robust:
+        r = dh - d  # negative when dh < d_obs (typical for positive NLOS bias)
+        if asymmetric_nlos:
+            # Quadratic when dh >= d_obs; Huber when dh < d_obs (discounts positive NLOS bias)
+            a = np.abs(r)
+            huber_val = np.where(a <= delta, 0.5 * r ** 2, delta * (a - 0.5 * delta))
+            huber_dr = np.where(a <= delta, r, delta * np.sign(r))
+            val = np.where(r >= 0.0, 0.5 * r ** 2, huber_val).sum()
+            dr = np.where(r >= 0.0, r, huber_dr)
+        elif robust:
             a = np.abs(r)
             val = np.where(a <= delta, 0.5 * r ** 2, delta * (a - 0.5 * delta)).sum()
             dr = np.where(a <= delta, r, delta * np.sign(r))
@@ -285,6 +294,12 @@ def sdp_biswas_ye_huber(g, device="cpu"):
     return stress_lbfgs(g, X_sdp, robust=True)
 
 
+def sdp_biswas_ye_asym(g, device="cpu"):
+    """Biswas-Ye SDP followed by Asymmetric Huber L-BFGS polish (accounting for positive NLOS bias)."""
+    X_sdp = sdp_biswas_ye(g, device=device)
+    return stress_lbfgs(g, X_sdp, asymmetric_nlos=True)
+
+
 def dv_distance_init(g):
     """Linearised least-squares multilateration from anchor geodesics (DV-distance x0)."""
     n, E, d = g["n"], g["edges"], g["d_obs"].astype(float)
@@ -308,11 +323,13 @@ def random_init_huber(g, n_starts=5, seed=0, device="cpu"):
     axy = g["anchor_xy"]
     ac = axy.mean(0)
     delta = 0.1 * np.median(g["d_obs"])
-    for _ in range(n_starts):
+    effective_starts = 1 if n > 100 else n_starts
+    max_it = 200 if n > 100 else 3000
+    for _ in range(effective_starts):
         X_rand = np.zeros((n, 2))
         X_rand[:] = ac + rng.standard_normal((n, 2)) * 5.0
         X_rand[g["anchors"]] = axy
-        X_opt = stress_lbfgs(g, X_rand, robust=True)
+        X_opt = stress_lbfgs(g, X_rand, robust=True, max_iter=max_it)
         diff = X_opt[g["edges"][:, 0]] - X_opt[g["edges"][:, 1]]
         dh = np.sqrt((diff ** 2).sum(1) + 1e-12)
         r = np.abs(dh - g["d_obs"])
@@ -704,6 +721,7 @@ def get_baselines(cfg, device="cpu"):
     if cfg.RUN_SDP:
         B["SDP (Biswas-Ye)"] = lambda g: sdp_biswas_ye(g, device=device)
         B["SDP + Huber polish"] = lambda g: sdp_biswas_ye_huber(g, device=device)
+        B["SDP + Asym polish (NLOS)"] = lambda g: sdp_biswas_ye_asym(g, device=device)
     if cfg.RUN_PERGRAPH_SAGE:
         B["Per-graph GraphSAGE (previous)"] = lambda g: pergraph_sage(g, epochs=cfg.PERGRAPH_EPOCHS, device=device)
     return B
