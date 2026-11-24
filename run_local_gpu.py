@@ -78,33 +78,30 @@ else:
 # ==================== 2. DATASET VERIFICATION ====================
 log_header("PHASE 2/5: STEP 1 - DATASET VERIFICATION")
 os.makedirs("data", exist_ok=True)
-need_data = not (os.path.exists("data/train.pkl") and os.path.exists("data/test.pkl"))
 need_data = not (os.path.exists("data/train.pkl") and os.path.exists("data/test_fresh.pkl"))
 if need_data:
-    sh("python -u step1_data.py")
+    sh("python3 -u step1_data.py")
 else:
-    print("[*] Datasets (train.pkl, test.pkl) already exist. Skipping Step 1.", flush=True)
     print("[*] Datasets (train.pkl, test_fresh.pkl) already exist. Skipping Step 1.", flush=True)
-
 
 # ==================== 3. MULTI-SEED MODEL & ABLATION TRAINING ====================
 log_header("PHASE 3/5: STEP 2 - MULTI-SEED TRAINING (FRESH SEEDS)")
 for s in SEEDS:
     tag_dir = f"seed{s}"
     print(f"\n>>> Training Proposed Learned Model for {tag_dir} (Epochs: {EPOCHS_TO_TRAIN}) <<<", flush=True)
-    sh(f"python -u step2_train.py --seed {s} --variant learned", RUN_TAG=tag_dir)
+    sh(f"python3 -u step2_train.py --seed {s} --variant learned", RUN_TAG=tag_dir)
     
     if s in ABLATION_SEEDS:
         for var in ABLATION_VARIANTS:
             print(f"\n>>> Training Ablation '{var}' for {tag_dir} (Epochs: {EPOCHS_TO_TRAIN}) <<<", flush=True)
-            sh(f"python -u step2_train.py --seed {s} --variant {var}", RUN_TAG=tag_dir)
+            sh(f"python3 -u step2_train.py --seed {s} --variant {var}", RUN_TAG=tag_dir)
 
 # ==================== 4. MULTI-SEED BENCHMARK EVALUATION ====================
 log_header("PHASE 4/5: STEP 3 - MULTI-SEED BENCHMARK EVALUATION")
 for s in SEEDS:
     tag_dir = f"seed{s}"
     print(f"\n>>> Starting Benchmark Evaluation on Identical Test Set: {tag_dir} <<<", flush=True)
-    sh("python -u step3_evaluate.py", RUN_TAG=tag_dir)
+    sh("python3 -u step3_evaluate.py", RUN_TAG=tag_dir)
 
 # ==================== 5. STATISTICAL AGGREGATION & DECISION RULE EVALUATION ====================
 log_header("PHASE 5/5: STATISTICAL AGGREGATION & DECISION RULE EVALUATION")

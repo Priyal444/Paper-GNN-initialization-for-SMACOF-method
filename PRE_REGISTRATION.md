@@ -4,7 +4,7 @@
 **Authors:** Priyanshu et al.  
 **Protocol Status:** Locked Prior to Fresh-Seed Master Execution  
 **Git Base Commit (`gnn_loc`):** `42addf2a945a5467bd8f4a5464af6935765bee95`  
-**Git Pre-Registration Lock Commit:** To be recorded upon user commit (`git commit -m "Lock pre-registered experiment config, fresh test set 8888, and pinned hyperparameters"`)  
+**Git Pre-Registration Lock Commit:** `d693157209c34c707eaebdb359815e1070aa1862`  
 **Calibration Rule:** All hyperparameter adjustments (LR reduced to `5e-4`, grad clip tightened to `0.5`, step clamp tightened to `1.0`) were chosen strictly on the validation set using pilot diagnostic runs (Seeds 0–2) prior to this lock, and are permanently frozen across all fresh evaluation runs.
 
 ---
