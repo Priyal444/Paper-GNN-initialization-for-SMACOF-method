@@ -78,11 +78,14 @@ VARIANT         = "learned"  # "learned" | "uniform" | "huber" | "huber_alpha" |
 LOSS_MODE       = "supervised"   # "supervised" (synthetic GT) | "selfsup" (no GT)
 HUBER_DELTA     = 0.05       # in normalised units (anchor-triangle scale = 1)
 AUX_WEIGHT      = 0.3        # weight of the encoder-output loss (deep supervision)
-EPOCHS          = 50
+EPOCHS          = 100        # Pinned pre-registered training epochs
 BATCH_GRAPHS    = 32
-LR              = 1e-3
+LR              = 5e-4       # Pinned pre-registered learning rate (stabilized)
 WEIGHT_DECAY    = 1e-5
-GRAD_CLIP       = 1.0
+GRAD_CLIP       = 0.5        # Pinned pre-registered gradient clipping
+STEP_CLAMP      = 1.0        # Pinned pre-registered step update clamp
+TEST_FILE       = "test_fresh.pkl"  # Held-out fresh test set
+TEST_SEED       = 8888       # Independent fresh test generation seed
 
 # ----------------------------------------------------------------------------
 # Evaluation (step 3)
@@ -90,7 +93,7 @@ GRAD_CLIP       = 1.0
 RUN_SDP            = True    # Biswas-Ye SDP via cvxpy (slowest baseline)
 RUN_PERGRAPH_SAGE  = True    # your previous approach (per-graph training)
 RUN_MPNN_LOC       = True    # MPNN-Loc (Xu & Lin, IFAC 2025)
-RUN_CPU_TIMING     = False   # Set to True for single-threaded CPU runtime benchmark
+RUN_CPU_TIMING     = True    # Set to True for single-threaded CPU runtime benchmark
 RUN_EXTENDED_EXPERIMENTS = True
 ANCHOR_COUNTS      = [3, 4, 5, 6, 7, 8]  # K = 3..8 anchor sensitivity sweep
 EXTENDED_TEST_PER_LEVEL = 50             # graphs per level for extended sweeps

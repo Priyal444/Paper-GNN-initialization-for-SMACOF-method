@@ -165,7 +165,7 @@ class LearnedSMACOFStep(nn.Module):
         den = scatter_sum(w[:, None], dst, x.size(0)).clamp_min(EPS)
         learn_alpha = (self.variant in ("learned", "huber_alpha"))
         alpha = torch.sigmoid(self.alpha_logit).clamp(min=0.1, max=0.7) if learn_alpha else 0.5
-        step_update = (num / den - x).clamp(min=-5.0, max=5.0)
+        step_update = (num / den - x).clamp(min=-1.0, max=1.0)
         x_new = x + alpha * step_update
         return torch.where(anchor_mask[:, None], x_anchor, x_new), w
 

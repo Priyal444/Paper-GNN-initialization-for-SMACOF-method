@@ -18,7 +18,7 @@ synthetic training graphs and for scoring).
 
 Run:  python step1_data.py
 """
-import pickle, time, os, glob
+import pickle, time, os, glob, sys
 import numpy as np
 import config as C
 from common import make_graph, ba_reachable, dump_run_config
@@ -125,22 +125,43 @@ if __name__ == "__main__":
 
     print("STEP 1: generating datasets", flush=True)
 
-    print("  [1/4] Generating training set...", flush=True)
-    save(mixed_set(np.random.default_rng(C.SEED), C.N_TRAIN, label="train"), "train.pkl")
-    print("  [2/4] Generating validation set...", flush=True)
-    save(mixed_set(np.random.default_rng(C.SEED + 1), C.N_VAL, label="val"), "val.pkl")
+    force = "--force" in sys.argv
+    if force or not os.path.exists(os.path.join(C.DATA_DIR, "train.pkl")):
+        print("  [1/4] Generating training set...", flush=True)
+        save(mixed_set(np.random.default_rng(C.SEED), C.N_TRAIN, label="train"), "train.pkl")
+    else:
+        print("  [1/4] train.pkl already exists (pass --force to recreate). Skipping.", flush=True)
+
+    if force or not os.path.exists(os.path.join(C.DATA_DIR, "val.pkl")):
+        print("  [2/4] Generating validation set...", flush=True)
+        save(mixed_set(np.random.default_rng(C.SEED + 1), C.N_VAL, label="val"), "val.pkl")
+    else:
+        print("  [2/4] val.pkl already exists. Skipping.", flush=True)
 
     if C.RUN_TRANSFER:
         print("  Generating transfer pools...", flush=True)
         for i, gt in enumerate(C.GRAPH_TYPES):
-            save(mixed_set(np.random.default_rng(C.SEED + 10 + i), C.N_TRAIN, [gt], label=f"train_{gt}"), f"train_pool_{gt}.pkl")
-            save(mixed_set(np.random.default_rng(C.SEED + 20 + i), C.N_VAL, [gt], label=f"val_{gt}"), f"val_pool_{gt}.pkl")
+            p_train = os.path.join(C.DATA_DIR, f"train_pool_{gt}.pkl")
+            p_val = os.path.join(C.DATA_DIR, f"val_pool_{gt}.pkl")
+            if force or not os.path.exists(p_train):
+                save(mixed_set(np.random.default_rng(C.SEED + 10 + i), C.N_TRAIN, [gt], label=f"train_{gt}"), f"train_pool_{gt}.pkl")
+            if force or not os.path.exists(p_val):
+                save(mixed_set(np.random.default_rng(C.SEED + 20 + i), C.N_VAL, [gt], label=f"val_{gt}"), f"val_pool_{gt}.pkl")
 
-    print("  [3/4] Generating test set...", flush=True)
-    test = scenario_set(np.random.default_rng(C.SEED + 2), C.N_NODES,
-                        C.TEST_SCENARIOS, C.MISSING_LEVELS, C.TEST_PER_LEVEL)
-    save(test, "test.pkl")
-    summary(test, "TEST SET")
+    print("  [3/4] Generating test sets...", flush=True)
+    if force or not os.path.exists(os.path.join(C.DATA_DIR, "test.pkl")):
+        test = scenario_set(np.random.default_rng(C.SEED + 2), C.N_NODES,
+                            C.TEST_SCENARIOS, C.MISSING_LEVELS, C.TEST_PER_LEVEL)
+        save(test, "test.pkl")
+    else:
+        print("  test.pkl already exists. Skipping.", flush=True)
+    fresh_seed = getattr(C, "TEST_SEED", 8888)
+    fresh_file = getattr(C, "TEST_FILE", "test_fresh.pkl")
+    print(f"  Generating held-out fresh test set ({fresh_file}) with seed {fresh_seed}...", flush=True)
+    test_fresh = scenario_set(np.random.default_rng(fresh_seed), C.N_NODES,
+                              C.TEST_SCENARIOS, C.MISSING_LEVELS, C.TEST_PER_LEVEL)
+    save(test_fresh, fresh_file)
+    summary(test_fresh, f"FRESH HELD-OUT TEST SET ({fresh_file}, seed={fresh_seed})")
 
     if C.RUN_GENERALISATION:
         gen_per_level = getattr(C, "GEN_TEST_PER_LEVEL", C.TEST_PER_LEVEL)

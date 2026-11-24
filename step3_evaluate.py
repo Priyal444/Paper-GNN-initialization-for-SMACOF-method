@@ -899,7 +899,8 @@ def main():
     if "--extended" in sys.argv:
         run_extended_sweeps(plot_only="--plot-only" in sys.argv); return
     if "--fair-runtime" in sys.argv:
-        run_fair_runtime_benchmark(load("test.pkl"), load_models(), BL.get_baselines(C, device="cpu")); return
+        test_file = getattr(C, "TEST_FILE", "test.pkl")
+        run_fair_runtime_benchmark(load(test_file), load_models(), BL.get_baselines(C, device="cpu")); return
     if "--plot-only" in sys.argv:          # redraw figures from saved results, no re-running
         main_plots(pd.read_csv(os.path.join(C.RESULTS_DIR, "all_results.csv")))
         print("figures redrawn"); return
@@ -911,9 +912,9 @@ def main():
     if not models:
         raise SystemExit("No checkpoints found -- run step2_train.py first.")
     print("  models:", list(models), flush=True)
-    baselines = BL.get_baselines(C, device=DEVICE)
-    test = load("test.pkl")
-    dump_run_config(C.RESULTS_DIR, step_name="step3")
+    test_file = getattr(C, "TEST_FILE", "test.pkl")
+    test = load(test_file)
+    print(f"  test set: {test_file} ({len(test)} graphs)", flush=True)
 
 
     # ---------------- main comparison ----------------
