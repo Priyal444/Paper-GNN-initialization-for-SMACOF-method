@@ -86,7 +86,15 @@ else:
 
 # ==================== 3. MULTI-SEED MODEL & ABLATION TRAINING ====================
 log_header("PHASE 3/5: STEP 2 - MULTI-SEED TRAINING (FRESH SEEDS)")
-for s in SEEDS:
+SKIP_TRAIN = os.environ.get("SKIP_TRAIN") == "1"   # reuse existing checkpoints (evaluation-only rerun)
+if SKIP_TRAIN:
+    missing_ckpts = [f"checkpoints/seed{s}/{v}.done" for s in SEEDS
+                     for v in (["learned"] + (ABLATION_VARIANTS if s in ABLATION_SEEDS else []))
+                     if not os.path.exists(f"checkpoints/seed{s}/{v}.done")]
+    if missing_ckpts:
+        raise SystemExit(f"SKIP_TRAIN=1 but these checkpoints are not finished: {missing_ckpts}")
+    print("[*] SKIP_TRAIN=1: all checkpoints present, skipping training.", flush=True)
+for s in ([] if SKIP_TRAIN else SEEDS):
     tag_dir = f"seed{s}"
     print(f"\n>>> Training Proposed Learned Model for {tag_dir} (Epochs: {EPOCHS_TO_TRAIN}) <<<", flush=True)
     sh(f"python3 -u step2_train.py --seed {s} --variant learned", RUN_TAG=tag_dir)

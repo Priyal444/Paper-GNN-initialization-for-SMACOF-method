@@ -912,8 +912,10 @@ def main():
     if not models:
         raise SystemExit("No checkpoints found -- run step2_train.py first.")
     print("  models:", list(models), flush=True)
+    baselines = BL.get_baselines(C, device=DEVICE)
     test_file = getattr(C, "TEST_FILE", "test.pkl")
     test = load(test_file)
+    dump_run_config(C.RESULTS_DIR, step_name="step3")
     print(f"  test set: {test_file} ({len(test)} graphs)", flush=True)
 
 
