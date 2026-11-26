@@ -86,23 +86,17 @@ else:
 
 # ==================== 3. MULTI-SEED MODEL & ABLATION TRAINING ====================
 log_header("PHASE 3/5: STEP 2 - MULTI-SEED TRAINING (FRESH SEEDS)")
-SKIP_TRAIN = os.environ.get("SKIP_TRAIN") == "1"   # reuse existing checkpoints (evaluation-only rerun)
-if SKIP_TRAIN:
-    missing_ckpts = [f"checkpoints/seed{s}/{v}.done" for s in SEEDS
-                     for v in (["learned"] + (ABLATION_VARIANTS if s in ABLATION_SEEDS else []))
-                     if not os.path.exists(f"checkpoints/seed{s}/{v}.done")]
-    if missing_ckpts:
-        raise SystemExit(f"SKIP_TRAIN=1 but these checkpoints are not finished: {missing_ckpts}")
-    print("[*] SKIP_TRAIN=1: all checkpoints present, skipping training.", flush=True)
-for s in ([] if SKIP_TRAIN else SEEDS):
+# A checkpoint is reused only if its .done marker exists (step2 deletes the marker when it
+# starts and rewrites it only after all epochs finish). FORCE_RETRAIN=1 retrains everything.
+FORCE_RETRAIN = os.environ.get("FORCE_RETRAIN") == "1"
+for s in SEEDS:
     tag_dir = f"seed{s}"
-    print(f"\n>>> Training Proposed Learned Model for {tag_dir} (Epochs: {EPOCHS_TO_TRAIN}) <<<", flush=True)
-    sh(f"python3 -u step2_train.py --seed {s} --variant learned", RUN_TAG=tag_dir)
-    
-    if s in ABLATION_SEEDS:
-        for var in ABLATION_VARIANTS:
-            print(f"\n>>> Training Ablation '{var}' for {tag_dir} (Epochs: {EPOCHS_TO_TRAIN}) <<<", flush=True)
-            sh(f"python3 -u step2_train.py --seed {s} --variant {var}", RUN_TAG=tag_dir)
+    for var in ["learned"] + (ABLATION_VARIANTS if s in ABLATION_SEEDS else []):
+        if not FORCE_RETRAIN and os.path.exists(f"checkpoints/{tag_dir}/{var}.done"):
+            print(f"[*] {tag_dir}/{var}: finished checkpoint found, skipping training.", flush=True)
+            continue
+        print(f"\n>>> Training '{var}' for {tag_dir} (Epochs: {EPOCHS_TO_TRAIN}) <<<", flush=True)
+        sh(f"python3 -u step2_train.py --seed {s} --variant {var}", RUN_TAG=tag_dir)
 
 # ==================== 4. MULTI-SEED BENCHMARK EVALUATION ====================
 log_header("PHASE 4/5: STEP 3 - MULTI-SEED BENCHMARK EVALUATION")

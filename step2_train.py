@@ -176,6 +176,10 @@ def main():
 
     best, log = np.inf, []
     ckpt = os.path.join(C.CKPT_DIR, f"{tag}.pt")
+    # A stale .done from an earlier run must not mark this (possibly interrupted) run as finished.
+    stale_done = ckpt.replace(".pt", ".done")
+    if os.path.exists(stale_done):
+        os.remove(stale_done)
     half_bs = max(1, batch_size // 2)
 
     for ep in range(1, args.epochs + 1):
