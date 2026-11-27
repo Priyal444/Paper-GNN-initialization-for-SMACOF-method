@@ -20,6 +20,25 @@ import numpy as np
 script_dir = os.path.dirname(os.path.abspath(__file__))
 gnn_loc_dir = os.path.join(script_dir, "gnn_loc") if os.path.exists(os.path.join(script_dir, "gnn_loc")) else script_dir
 os.chdir(gnn_loc_dir)
+
+
+class _Tee:
+    """Copy everything printed (including child-process output relayed by sh()) to a log file."""
+    def __init__(self, stream, fh):
+        self.stream, self.fh = stream, fh
+    def write(self, s):
+        self.stream.write(s); self.fh.write(s); self.fh.flush()
+    def flush(self):
+        self.stream.flush(); self.fh.flush()
+
+
+# One new log file per launch, never overwritten: logs/run_YYYYmmdd_HHMMSS.log
+os.makedirs("logs", exist_ok=True)
+LOG_PATH = os.path.join("logs", time.strftime("run_%Y%m%d_%H%M%S.log"))
+_log_fh = open(LOG_PATH, "a", encoding="utf-8")
+sys.stdout = _Tee(sys.stdout, _log_fh)
+sys.stderr = _Tee(sys.stderr, _log_fh)   # so a crash traceback of this script is logged too
+print(f"[*] Logging this run to {os.path.abspath(LOG_PATH)}", flush=True)
 print(f"[*] Working Directory: {os.getcwd()}", flush=True)
 
 # ----------------- CONFIGURATION SETTINGS -----------------
@@ -100,8 +119,17 @@ for s in SEEDS:
 
 # ==================== 4. MULTI-SEED BENCHMARK EVALUATION ====================
 log_header("PHASE 4/5: STEP 3 - MULTI-SEED BENCHMARK EVALUATION")
+# step3 writes results/<seed>/step3_main.done after stages 1-2 and step3.done at the very end,
+# so a crash in stage 3/4 resumes with --gen-only instead of recomputing the main benchmark.
 for s in SEEDS:
     tag_dir = f"seed{s}"
+    if os.path.exists(f"results/{tag_dir}/step3.done"):
+        print(f"[*] {tag_dir}: step 3 already complete, skipping.", flush=True)
+        continue
+    if os.path.exists(f"results/{tag_dir}/step3_main.done"):
+        print(f"\n>>> {tag_dir}: main benchmark already saved; running stages 3-4 only <<<", flush=True)
+        sh("python3 -u step3_evaluate.py --gen-only", RUN_TAG=tag_dir)
+        continue
     print(f"\n>>> Starting Benchmark Evaluation on Identical Test Set: {tag_dir} <<<", flush=True)
     sh("python3 -u step3_evaluate.py", RUN_TAG=tag_dir)
 

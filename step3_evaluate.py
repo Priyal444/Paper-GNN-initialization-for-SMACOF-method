@@ -91,27 +91,67 @@ def load_models(transfer=False):
 
 
 
+GNN_CPU_FALLBACKS = 0          # graphs whose GNN forward pass had to run on CPU (GPU OOM)
+MAX_EDGES_PER_BATCH = 150_000  # directed edges per forward batch; bounds GPU memory on big graphs
+
+
+def _forward_chunks(m, chk, dev, bs):
+    """Forward pass over `chk` in batches of `bs` graphs. Graphs in a batch are disconnected
+    components, so batching does not change any prediction, only memory use and timing.
+    On CUDA OOM: retry that batch one graph at a time; if a single graph still does not fit,
+    run it on CPU (counted in GNN_CPU_FALLBACKS, because its timing is then a CPU timing)."""
+    import copy
+    global GNN_CPU_FALLBACKS
+    T_eval = lambda mm: None if mm.T == 0 else C.TEST_REFINE_STEPS
+    out, t = [], 0.0
+    cpu_model = None
+    with torch.no_grad():
+        for i in range(0, len(chk), bs):
+            b_chk = chk[i:i + bs]
+            try:
+                B = collate(b_chk, dev)
+                t0 = time.perf_counter(); x, _ = m(B, T=T_eval(m))
+                if "cuda" in dev: torch.cuda.synchronize(dev)
+                t += time.perf_counter() - t0
+                out += to_original_units(B, x)
+                continue
+            except torch.OutOfMemoryError:
+                B = x = None
+                torch.cuda.empty_cache()
+            for g in b_chk:
+                try:
+                    B = collate([g], dev)
+                    t0 = time.perf_counter(); x, _ = m(B, T=T_eval(m))
+                    if "cuda" in dev: torch.cuda.synchronize(dev)
+                except torch.OutOfMemoryError:
+                    B = x = None
+                    torch.cuda.empty_cache()
+                    if cpu_model is None:
+                        cpu_model = copy.deepcopy(m).to("cpu").eval()
+                    GNN_CPU_FALLBACKS += 1
+                    print(f"    [WARN] GPU OOM on a graph with n={g.get('n')}; running it on CPU "
+                          f"(GNN CPU fallbacks so far: {GNN_CPU_FALLBACKS})", flush=True)
+                    B = collate([g], "cpu")
+                    t0 = time.perf_counter(); x, _ = cpu_model(B, T=T_eval(cpu_model))
+                t += time.perf_counter() - t0
+                out += to_original_units(B, x)
+            torch.cuda.empty_cache()
+    return out, t
+
+
 def run_gnn(model, graphs, bs=64):
     """One forward pass per batch; parallel across available GPUs."""
     import copy, concurrent.futures
     avg_n = int(np.mean([g.get('n', 50) for g in graphs])) if graphs else 50
-    bs = max(1, min(bs, 2000 // max(1, avg_n)))
+    avg_e = int(np.mean([g["edge_index"].shape[1] for g in graphs])) if graphs else 1
+    bs = max(1, min(bs, 2000 // max(1, avg_n), MAX_EDGES_PER_BATCH // max(1, avg_e)))
     if len(DEVICES) >= 2 and len(graphs) >= 2:
         models_per_dev = [model if dev == DEVICE else copy.deepcopy(model).to(dev).eval()
                           for dev in DEVICES]
         split_indices = np.array_split(np.arange(len(graphs)), len(DEVICES))
-        
+
         def run_dev(m, chk, dev):
-            out, t = [], 0.0
-            with torch.no_grad():
-                for i in range(0, len(chk), bs):
-                    b_chk = chk[i:i + bs]
-                    B = collate(b_chk, dev)
-                    t0 = time.perf_counter(); x, _ = m(B, T=None if m.T == 0 else C.TEST_REFINE_STEPS)
-                    if "cuda" in dev: torch.cuda.synchronize(dev)
-                    t += time.perf_counter() - t0
-                    out += to_original_units(B, x)
-            return out, t
+            return _forward_chunks(m, chk, dev, bs)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(DEVICES)) as pool:
             futures = [pool.submit(run_dev, models_per_dev[idx], [graphs[k] for k in split_indices[idx]], DEVICES[idx])
@@ -124,15 +164,7 @@ def run_gnn(model, graphs, bs=64):
                 total_t += t_dev
         return all_out, total_t / len(graphs)
     else:
-        out, t = [], 0.0
-        with torch.no_grad():
-            for i in range(0, len(graphs), bs):
-                chunk = graphs[i:i + bs]
-                B = collate(chunk, DEVICE)
-                t0 = time.perf_counter(); x, _ = model(B, T=None if model.T == 0 else C.TEST_REFINE_STEPS)
-                if DEVICE.startswith("cuda"): torch.cuda.synchronize()
-                t += time.perf_counter() - t0
-                out += to_original_units(B, x)
+        out, t = _forward_chunks(model, graphs, DEVICE, bs)
         return out, t / len(graphs)
 
 
@@ -901,6 +933,12 @@ def main():
     if "--fair-runtime" in sys.argv:
         test_file = getattr(C, "TEST_FILE", "test.pkl")
         run_fair_runtime_benchmark(load(test_file), load_models(), BL.get_baselines(C, device="cpu")); return
+    if "--gen-only" in sys.argv:           # resume after a crash in stage 3/4 (stages 1-2 already saved)
+        models = load_models()
+        if not models:
+            raise SystemExit("No checkpoints found -- run step2_train.py first.")
+        print(f"STEP 3 (--gen-only): stages 3-4 only, device {DEVICE}; models: {list(models)}", flush=True)
+        run_generalisation_and_ba(models, BL.get_baselines(C, device=DEVICE)); return
     if "--plot-only" in sys.argv:          # redraw figures from saved results, no re-running
         main_plots(pd.read_csv(os.path.join(C.RESULTS_DIR, "all_results.csv")))
         print("figures redrawn"); return
@@ -966,6 +1004,15 @@ def main():
     piv_med = summ.pivot_table(index=["scenario", "missing"], columns="method", values="rmse_median")
     print("\nMEDIAN COORDINATE RMSE (lower is better)\n", piv_med.round(3).to_string())
 
+    # Stages 1-2 finished: a later crash only needs `--gen-only` (stages 3-4), not a full rerun.
+    with open(os.path.join(C.RESULTS_DIR, "step3_main.done"), "w") as fh:
+        fh.write(f"stages 1-2 complete; SDP fallbacks: {sdp_fb}; GNN CPU fallbacks: {GNN_CPU_FALLBACKS}\n")
+
+    run_generalisation_and_ba(models, baselines)
+
+
+def run_generalisation_and_ba(models, baselines):
+    """Stages 3-4: size generalisation and Barabasi-Albert sweep."""
     # ---------------- generalisation to bigger graphs ----------------
     print(f"\n=======================================================", flush=True)
     print(f" [STAGE 3/4] Size Generalisation to Large Graphs (N = {C.GENERALISE_SIZES})", flush=True)
@@ -1015,6 +1062,9 @@ def main():
         ax[1].set_xlabel("m"); ax[1].set_ylim(0, 1.05); ax[1].legend(); ax[1].set_title("Is the answer unique?")
         plt.tight_layout(); save_fig_both("fig_ba_rigidity.png", dpi=150)
 
+    print(f"\n[NOTE] GNN CPU fallbacks (GPU OOM) in this process: {GNN_CPU_FALLBACKS}", flush=True)
+    with open(os.path.join(C.RESULTS_DIR, "step3.done"), "w") as fh:
+        fh.write(f"all stages complete; GNN CPU fallbacks in final process: {GNN_CPU_FALLBACKS}\n")
     print(f"\nSTEP 3 done. Figures and CSVs in {C.RESULTS_DIR}")
 
 
